@@ -3,14 +3,14 @@ set -e
 
 # export http_proxy=http://192.168.32.28:18000 && export https_proxy=http://192.168.32.28:18000
 
-LAST05_ROOT="/mnt/nas/zhangyiming/last05_beta/last05"
+LAST05_ROOT="/mnt/nas/zhangyiming/last05_beta/last05_mot2_action"
 
 cd "${LAST05_ROOT}/scripts"
 source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
 export WANDB_API_KEY="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"
 export PATH=/root/miniconda3/envs/last05/bin:$PATH
 # export HF_HOME=/media/huggingFace
-export PYTHONPATH="${LAST05_ROOT}:/mnt/nas/zhangyiming/last05_beta/last05:${PYTHONPATH:-}"
+export PYTHONPATH="${LAST05_ROOT}:${PYTHONPATH:-}"
 export PATH=/media/miniconda3/envs/last05.1/bin:$PATH
 export OMP_NUM_THREADS=4
 export HF_HUB_OFFLINE=1

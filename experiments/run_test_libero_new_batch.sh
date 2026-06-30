@@ -11,25 +11,26 @@ DRY_RUN="${DRY_RUN:-false}"
 
 # Edit these rows to define the batch. CHECKPOINTS can contain checkpoint
 # directories or .pt files accepted by test_libero_new_batch_worker.sh.
+# Leave an entry empty to let the worker select the latest checkpoint from RUN_NAME.
 CHECKPOINTS=(
-  "/mnt/nas/zhangyiming/last05_beta/last05/exp_cosmos_vla_3expert/cosmos2B_janus1B_3expert_baseline/checkpoint-epoch-29-step-25470"
+  ""
 )
 
 # Arrays below support either one value (broadcast to every checkpoint) or
 # exactly one value per CHECKPOINTS entry.
-RUN_NAME_VALUES=("cosmos2B_janus1B_3expert_baseline")
-CHECKPOINT_NAME_VALUES=("checkpoint-epoch-29-step-25470")
+RUN_NAME_VALUES=("cosmos2B_action1B_mot2_libero_spatial")
+CHECKPOINT_NAME_VALUES=("")
 NUM_TRIALS_PER_TASK_VALUES=(10)
-ACTION_SELF_CAUSAL_IN_BRIDGE_VALUES=("false")
+ACTION_SELF_CAUSAL_IN_BRIDGE_VALUES=("true")
 STATE_ENCODING_MODE_VALUES=("mlp")
 USE_VALUE_PREDICTION_VALUES=("false")
 USE_ACTION_VALUE_PREDICTION_VALUES=("false")
 ACTION_VALUE_LOSS_WEIGHT_VALUES=("1.0")
 VALUE_TOKEN_MASK_VIDEO_TO_VALUE_VALUES=("false")
 VALUE_TOKEN_MASK_NONVALUE_TO_VALUE_VALUES=("false")
-BRIDGE_POS_SCHEME_VALUES=("mrope")
+BRIDGE_POS_SCHEME_VALUES=("llama1d")
 DECOSMOS_VALUES=("false")
-COSMOS_SELF_ONLY_BRIDGE_VALUES=("true")
+COSMOS_SELF_ONLY_BRIDGE_VALUES=("false")
 REWRITE_EVAL_PROMPT_VALUES=("false")
 COSMOS_TEXT_CACHE_PATH_VALUES=("/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_raw_full_concat")
 COSMOS_DENOISE_STEPS_VALUES=(2)
@@ -43,8 +44,8 @@ IMG_LATENTS_PER_FUTURE_VALUES=(0)
 STATE_LATENTS_PER_FUTURE_VALUES=(0)
 NUM_FUTURE_FRAMES_VALUES=(0)
 FUTURE_FRAME_STRIDE_VALUES=(8)
-VIDEO_FRAMES_VALUES=(17)
-NUM_COND_INPUT_FRAMES_VALUES=(5)
+VIDEO_FRAMES_VALUES=(1)
+NUM_COND_INPUT_FRAMES_VALUES=(1)
 ACTION_CHUNK_VALUES=(16)
 FPS_VALUES=(20)
 CONTROL_FREQ_VALUES=(0)

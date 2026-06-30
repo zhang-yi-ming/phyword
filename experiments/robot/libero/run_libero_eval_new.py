@@ -37,7 +37,11 @@ if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
 from janus.models import VLChatProcessor, ActionTokenizer
-from models.cosmos_janus_cot import CosmosJanusMoT3Expert, build_token_sequence_mask, normalize_bridge_pos_scheme
+from models.cosmos_janus_action_spatial import (
+    CosmosJanusActionSpatialMoT2Expert,
+    normalize_bridge_pos_scheme,
+)
+from models.cosmos_janus_cot import build_token_sequence_mask
 from cosmos_predict2._src.predict2.utils.model_loader import load_model_from_checkpoint
 from scripts.rewrite_input_prompts import PROMPT_REPLACEMENTS
 from utils.cosmos_text_cache import CosmosQwenTextEmbedder, CosmosTextEmbeddingCache
@@ -57,13 +61,13 @@ from experiments.robot.libero.history_trajectory_utils import (
 )
 
 JANUS_ACTION_PROMPT_SUFFIX = (
-    "Please refer to the current task and the historical trajectory in the image, "
+    "Please refer to the current image and task instruction, predict the spatial token "
     "and output the action to execute now."
 )
 
 
 def build_janus_action_prompt_suffix(use_history_trajectory: bool) -> str:
-    return JANUS_ACTION_PROMPT_SUFFIX if use_history_trajectory else ""
+    return JANUS_ACTION_PROMPT_SUFFIX
 
 # Define task suite constants
 class TaskSuite(str, Enum):
@@ -148,21 +152,21 @@ class GenerateConfig:
     num_cond_input_frames: int = 1
     action_dim: int = 7
     action_chunk: int = 16
-    robot_state: int = 1
+    robot_state: int = 0
     state_placeholder_tokens: int = 8
-    state_encoding_mode: str = "token"
+    state_encoding_mode: str = "mlp"
     action_intermediate_size: int = 0                # If 0, infer slim MLP size from checkpoint; if >0, require an exact match
-    model_variant: str = "three_expert_cot"          # Ignored; this eval script always builds the CoT 3-expert model.
+    model_variant: str = "mot2_action_spatial"      # This eval script builds the 2-MoT Cosmos + action-spatial model.
     total_latent_tokens: int = 1                     # Number of latent token CE tokens to generate at eval time
     img_latents_per_future: int = 1
     state_latents_per_future: int = 1
     num_future_frames: int = 4
     future_frame_stride: int = 0                     # Training-time interval between latent CoT future observations; if <=0, defaults to action_chunk
-    joint_action_prefill: bool = True                # Refresh video KV with one joint 3-expert pass before action denoising
-    cosmos_self_only_bridge: bool = True            # Match training option that keeps cosmos bridge attention video-only
+    joint_action_prefill: bool = False               # Legacy compatibility; ignored by the 2-MoT action-spatial model
+    cosmos_self_only_bridge: bool = False            # Fixed 2-MoT behavior: action can see Cosmos, Cosmos cannot see action
     decosmos: bool = False                           # Match training option: latent/action do not attend to Cosmos KV; skip Cosmos inference
-    use_value_prediction: bool = False               # Match training option: append a Cosmos value-prediction latent probe
-    use_action_value_prediction: bool = False        # Match training option: append one scalar value token to the action branch
+    use_value_prediction: bool = False               # Fixed 2-MoT behavior: no value prediction branch
+    use_action_value_prediction: bool = False        # Fixed 2-MoT behavior: no action value token
     value_token_mask_video_to_value: bool = False     # If true, video tokens cannot attend to value tokens
     value_token_mask_nonvalue_to_value: bool = False  # If true, all non-value tokens cannot attend to value tokens
     bridge_pos_scheme: str = "local"                 # Accepts mrope/mrope_interleave/llama1d plus legacy aliases local/last0
@@ -205,7 +209,7 @@ class GenerateConfig:
     action_denoise_steps: int = 10                     # Number of action denoising steps
     cosmos_denoise_steps: int = 1                      # Number of Cosmos scheduler steps before KV reuse
     fps: float = 10.0                                  # FPS for predicted Cosmos videos
-    action_self_causal_in_bridge: bool = False         # In inference bridge attention, whether action->action is causal (False = bidirectional, matching flow-matching training)
+    action_self_causal_in_bridge: bool = True          # Fixed 2-MoT behavior: causal action prefix, final action tokens mutually visible
 
     # fmt: on
 
@@ -302,22 +306,24 @@ def validate_config(cfg: GenerateConfig) -> None:
     cfg.history_trajectory_camera_config_path = str(
         getattr(cfg, "history_trajectory_camera_config_path", "") or DEFAULT_HISTORY_TRAJECTORY_CAMERA_CONFIG
     ).strip()
-    cfg.cosmos_self_only_bridge = coerce_bool(getattr(cfg, "cosmos_self_only_bridge", False))
-    cfg.decosmos = coerce_bool(getattr(cfg, "decosmos", False))
-    cfg.use_value_prediction = coerce_bool(getattr(cfg, "use_value_prediction", False))
-    cfg.use_action_value_prediction = coerce_bool(
-        getattr(cfg, "use_action_value_prediction", False)
-    )
-    cfg.value_token_mask_nonvalue_to_value = coerce_bool(
-        getattr(cfg, "value_token_mask_nonvalue_to_value", False)
-    )
-    cfg.value_token_mask_video_to_value = coerce_bool(
-        getattr(cfg, "value_token_mask_video_to_value", False)
-    ) or cfg.value_token_mask_nonvalue_to_value
-    if cfg.use_value_prediction and cfg.decosmos:
-        raise ValueError("use_value_prediction requires decosmos=false.")
-    cfg.action_self_causal_in_bridge = coerce_bool(getattr(cfg, "action_self_causal_in_bridge", False))
+    cfg.cosmos_self_only_bridge = False
+    cfg.decosmos = False
+    cfg.use_value_prediction = False
+    cfg.use_action_value_prediction = False
+    cfg.value_token_mask_nonvalue_to_value = False
+    cfg.value_token_mask_video_to_value = False
+    cfg.action_self_causal_in_bridge = True
     cfg.rewrite_eval_prompt = coerce_bool(getattr(cfg, "rewrite_eval_prompt", False))
+    cfg.use_history_trajectory_janus_image = False
+    cfg.action_use_latent_prefix = True
+    cfg.action_use_image_prefix = False
+    cfg.cosmos_self_only_bridge = False
+    cfg.decosmos = False
+    cfg.use_value_prediction = False
+    cfg.use_action_value_prediction = False
+    cfg.value_token_mask_nonvalue_to_value = False
+    cfg.value_token_mask_video_to_value = False
+    cfg.action_self_causal_in_bridge = True
     if int(getattr(cfg, "future_frame_stride", 0) or 0) <= 0:
         cfg.future_frame_stride = cfg.action_chunk
     cfg.bridge_pos_scheme = normalize_bridge_pos_scheme(cfg.bridge_pos_scheme)
@@ -366,6 +372,134 @@ def resolve_checkpoint_paths(pretrained_checkpoint: Union[str, Path]):
             return ckpt_path, base_dir
 
     return os.path.join(base_dir, candidate_names[0]), base_dir
+
+
+def checkpoint_has_processor_files(checkpoint_dir: str) -> bool:
+    if not checkpoint_dir:
+        return False
+    return any(
+        os.path.exists(os.path.join(checkpoint_dir, name))
+        for name in (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "processor_config.json",
+            "preprocessor_config.json",
+        )
+    )
+
+
+def load_processor_for_checkpoint(model_path: str, checkpoint_dir: str):
+    candidate_paths = []
+    if checkpoint_dir and checkpoint_dir not in candidate_paths:
+        candidate_paths.append(checkpoint_dir)
+    if model_path and model_path not in candidate_paths:
+        candidate_paths.append(model_path)
+
+    last_error = None
+    for candidate in candidate_paths:
+        try:
+            processor = VLChatProcessor.from_pretrained(candidate, trust_remote_code=True)
+            if candidate != model_path:
+                logger.info("Loaded VLChatProcessor from %s", candidate)
+            return processor
+        except Exception as exc:
+            last_error = exc
+            logger.info("Failed to load VLChatProcessor from %s: %s", candidate, exc)
+            if candidate == checkpoint_dir and checkpoint_has_processor_files(checkpoint_dir):
+                raise RuntimeError(
+                    "Checkpoint directory contains tokenizer/processor files but they could not be loaded: "
+                    f"{checkpoint_dir}"
+                ) from exc
+    raise last_error
+
+
+def infer_checkpoint_vocab_size(state_dict: dict[str, Any]) -> Optional[int]:
+    vocab_keys = [
+        "janus.language_model.model.embed_tokens.weight",
+        "janus.language_model.lm_head.weight",
+    ]
+    sizes = []
+    for key in vocab_keys:
+        value = state_dict.get(key)
+        if value is not None and hasattr(value, "shape") and len(value.shape) >= 1:
+            sizes.append(int(value.shape[0]))
+    if not sizes:
+        return None
+    if len(set(sizes)) != 1:
+        raise ValueError(f"Checkpoint embedding/lm_head vocab sizes disagree: {dict(zip(vocab_keys, sizes))}")
+    return sizes[0]
+
+
+def ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size: Optional[int] = None) -> None:
+    tokenizer_vocab = int(len(tokenizer))
+    target_vocab = int(target_vocab_size or tokenizer_vocab)
+    if target_vocab < tokenizer_vocab:
+        raise ValueError(
+            f"Target Janus vocab size {target_vocab} is smaller than tokenizer length {tokenizer_vocab}."
+        )
+    language_model = janus_model.language_model
+    embed = language_model.get_input_embeddings()
+    current_vocab = int(embed.weight.shape[0])
+    lm_head = getattr(language_model, "lm_head", None)
+    lm_head_vocab = None
+    if lm_head is not None and getattr(lm_head, "weight", None) is not None:
+        lm_head_vocab = int(lm_head.weight.shape[0])
+    if current_vocab == target_vocab and (lm_head_vocab is None or lm_head_vocab == target_vocab):
+        logger.info(
+            "Janus vocab exactly matches target: tokenizer=%s, target=%s, embedding=%s, lm_head=%s",
+            tokenizer_vocab,
+            target_vocab,
+            current_vocab,
+            lm_head_vocab if lm_head_vocab is not None else "N/A",
+        )
+        return
+    logger.info(
+        "Resizing Janus token embeddings/lm_head for tokenizer alignment: "
+        "tokenizer=%s, target=%s, embedding=%s, lm_head=%s",
+        tokenizer_vocab,
+        target_vocab,
+        current_vocab,
+        lm_head_vocab if lm_head_vocab is not None else "N/A",
+    )
+    language_model.resize_token_embeddings(target_vocab)
+    if hasattr(janus_model.config, "vocab_size"):
+        janus_model.config.vocab_size = target_vocab
+    if hasattr(janus_model.config, "language_config"):
+        janus_model.config.language_config.vocab_size = target_vocab
+    if hasattr(language_model, "config"):
+        language_model.config.vocab_size = target_vocab
+
+
+def validate_checkpoint_vocab_size(state_dict: dict[str, Any], tokenizer) -> None:
+    tokenizer_vocab = int(len(tokenizer))
+    vocab_keys = [
+        "janus.language_model.model.embed_tokens.weight",
+        "janus.language_model.lm_head.weight",
+    ]
+    mismatches = []
+    checkpoint_vocab_sizes = []
+    for key in vocab_keys:
+        value = state_dict.get(key)
+        if value is not None and hasattr(value, "shape"):
+            checkpoint_vocab = int(value.shape[0])
+            checkpoint_vocab_sizes.append(checkpoint_vocab)
+            if checkpoint_vocab < tokenizer_vocab:
+                mismatches.append(f"{key}: checkpoint={checkpoint_vocab}, tokenizer={tokenizer_vocab}")
+    if len(set(checkpoint_vocab_sizes)) > 1:
+        mismatches.append(f"checkpoint embedding/lm_head sizes disagree: {checkpoint_vocab_sizes}")
+    if mismatches:
+        raise ValueError(
+            "Checkpoint vocab size is incompatible with this LIBERO tokenizer. "
+            "Use the processor/tokenizer saved with the checkpoint, or evaluate with the same extra special tokens. "
+            f"Mismatches: {', '.join(mismatches)}"
+        )
+    if checkpoint_vocab_sizes and checkpoint_vocab_sizes[0] > tokenizer_vocab:
+        logger.info(
+            "Checkpoint vocab rows (%s) exceed tokenizer length (%s); treating extra rows as padded lm_head/embed rows.",
+            checkpoint_vocab_sizes[0],
+            tokenizer_vocab,
+        )
 
 
 def infer_action_intermediate_size_from_state_dict(state_dict: dict[str, Any]) -> Optional[int]:
@@ -439,12 +573,22 @@ def attach_cosmos_inference_runtime(model, cosmos_wrapper):
 
 def model_load(cfg: Any):
     cfg.bridge_pos_scheme = normalize_bridge_pos_scheme(getattr(cfg, "bridge_pos_scheme", "mrope"))
+    cfg.cosmos_self_only_bridge = False
+    cfg.decosmos = False
+    cfg.action_use_latent_prefix = True
+    cfg.action_self_causal_in_bridge = True
+    cfg.use_value_prediction = False
+    cfg.use_action_value_prediction = False
+    cfg.value_token_mask_video_to_value = False
+    cfg.value_token_mask_nonvalue_to_value = False
+    cfg.total_spatial_tokens = int(getattr(cfg, "total_latent_tokens", 1) or 1)
+    ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
 
     # =================================================================
-    # 1. 从原始基座加载 Processor
+    # 1. 从 checkpoint 优先加载 Processor / Tokenizer
     # =================================================================
-    print(f"Loading Processor from {cfg.model_path}...")
-    vl_chat_processor = VLChatProcessor.from_pretrained(cfg.model_path, trust_remote_code=True)
+    print(f"Loading Processor from checkpoint/base: {base_dir} / {cfg.action_model_path or cfg.model_path}...")
+    vl_chat_processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
     tokenizer = vl_chat_processor.tokenizer
     action_tokenizer = ActionTokenizer(tokenizer, need_to_sub=3)
     cfg.janus_image_start_id = getattr(vl_chat_processor, "image_start_id", None)
@@ -458,17 +602,6 @@ def model_load(cfg: Any):
 
 
     cfg.latent_end_id = tokenizer.convert_tokens_to_ids("<|latent_end|>")
-    tokenizer_unk_id = tokenizer.unk_token_id
-    if (
-        cfg.latent_end_id is None
-        or cfg.latent_end_id < 0
-        or (
-            tokenizer_unk_id is not None
-            and cfg.latent_end_id == tokenizer_unk_id
-            and tokenizer.unk_token != "<|latent_end|>"
-        )
-    ):
-        raise ValueError("Could not resolve Janus <|latent_end|> token id.")
 
 
     # =================================================================
@@ -506,21 +639,23 @@ def model_load(cfg: Any):
     resolve_video_condition_config(cfg, cosmos_wrapper.tokenizer)
     
     # =================================================================
-    # 4. 组装 MoT 架构并灌入我们全参保存的权重
+    # 4. 组装 2-MoT 架构并灌入我们全参保存的权重
     # =================================================================
-    cfg.model_variant = "three_expert_cot"
-    
-    # 动态解析检查点路径
-    ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
+    cfg.model_variant = "mot2_action_spatial"
 
     print(f"Loading Fine-Tuned MoT Weights from {ckpt_path}...")
     
     state_dict = torch.load(ckpt_path, map_location="cpu")
-    maybe_infer_action_intermediate_size(cfg, state_dict)
+    validate_checkpoint_vocab_size(state_dict, tokenizer)
+    checkpoint_vocab_size = infer_checkpoint_vocab_size(state_dict)
+    ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size=checkpoint_vocab_size)
+    cfg.valid_token_vocab_size = int(len(tokenizer))
+    if checkpoint_vocab_size is not None:
+        cfg.checkpoint_vocab_size = int(checkpoint_vocab_size)
     log_resolved_inference_config(cfg)
 
-    print("Building 3-Expert Joint MoT Architecture...")
-    model = CosmosJanusMoT3Expert(cosmos_wrapper.net, cosmos_wrapper.tokenizer, janus_model, cfg)
+    print("Building 2-MoT Cosmos + action-spatial Architecture...")
+    model = CosmosJanusActionSpatialMoT2Expert(cosmos_wrapper.net, cosmos_wrapper.tokenizer, janus_model, cfg)
     attach_cosmos_inference_runtime(model, cosmos_wrapper)
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -1141,6 +1276,20 @@ def run_episode(
                 images=[janus_primary_image],
                 return_tensors="pt"
             )
+            cosmos_user_content = f"<image_placeholder>\n{eval_prompt}"
+            if state_tokens_str:
+                cosmos_user_content += f"\n{state_tokens_str}"
+            cosmos_user_prompt = processor.apply_sft_template_for_multi_turn_prompts(
+                conversations=[{"role": "<|User|>", "content": cosmos_user_content}],
+                sft_format=processor.sft_format,
+                system_prompt="",
+            )
+            cosmos_prompt_text = cosmos_user_prompt + "\n\n<|Assistant|>:"
+            cosmos_janus_inputs = processor(
+                prompt=cosmos_prompt_text,
+                images=[janus_primary_image],
+                return_tensors="pt",
+            )
 
             janus_input_ids = janus_inputs.input_ids.to(device)
             janus_pixel_values = janus_inputs.pixel_values.to(device).to(dtype)
@@ -1158,15 +1307,17 @@ def run_episode(
                 janus_attention_mask = janus_inputs.attention_mask.to(device).to(torch.bool)
             pad_token_id = resolve_pad_token_id(processor)
             janus_left_pad_lens = janus_input_ids.eq(pad_token_id).to(torch.long).cumprod(dim=1).sum(dim=1)
-            janus_action_pixel_values = processor.image_processor(
-                [wrist_image],
-                return_tensors="pt",
-            )["pixel_values"].unsqueeze(0).to(device).to(dtype)
+            cosmos_janus_input_ids = cosmos_janus_inputs.input_ids.to(device)
+            cosmos_janus_state_seq_mask = build_token_sequence_mask(
+                cosmos_janus_input_ids,
+                state_placeholder_ids,
+                require_match=bool(int(getattr(cfg, "robot_state", 0) or 0)),
+                name="current state placeholder in Cosmos prompt",
+            ).to(device)
 
             if inference_idx == 0:
                 log_message(
                     "Eval input smoke: "
-                    f"janus_action_pixel_values={tuple(janus_action_pixel_values.shape)}, "
                     f"janus_state_seq_mask.sum={int(janus_state_seq_mask.sum().item())}, "
                     f"attention_mask.sum={int(janus_attention_mask.sum().item())}, "
                     f"cosmos_history_frames={len(obs_history)}",
@@ -1218,23 +1369,19 @@ def run_episode(
                     num_latent_tokens=cfg.total_latent_tokens,
                     janus_left_pad_lens=janus_left_pad_lens,
                     janus_state_seq_mask=janus_state_seq_mask,
-                    janus_action_pixel_values=janus_action_pixel_values,
                     janus_attention_mask=janus_attention_mask,
                     now_state=now_state,
                     cosmos_text_embeddings=cosmos_text_embeddings,
-                    return_value_prediction=cfg.use_value_prediction,
-                    return_action_value_prediction=cfg.use_action_value_prediction,
+                    cosmos_janus_input_ids=cosmos_janus_input_ids,
+                    cosmos_janus_images_seq_mask=cosmos_janus_inputs.images_seq_mask.to(device),
+                    cosmos_janus_state_seq_mask=cosmos_janus_state_seq_mask,
+                    cosmos_janus_images_emb_mask=cosmos_janus_inputs.images_emb_mask.to(device),
                 )
 
                 inference_outputs = model.forward_flow_joint_inference(**inference_kwargs)
                 predicted_value = None
                 predicted_action_value = None
-                if cfg.use_action_value_prediction:
-                    pred_video, pred_action, predicted_value, predicted_action_value = inference_outputs
-                elif cfg.use_value_prediction:
-                    pred_video, pred_action, predicted_value = inference_outputs
-                else:
-                    pred_video, pred_action = inference_outputs
+                pred_video, pred_action = inference_outputs[:2]
 
             cosmos_value_score = None
             action_value_score = None

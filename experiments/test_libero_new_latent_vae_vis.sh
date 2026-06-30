@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 
-LAST05_ROOT="/mnt/nas/zhangyiming/last05_beta/last05"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
 COSMOS_ROOT="/mnt/nas/zhangyiming/experiments"
 LIBERO_ROOT="/mnt/nas/zhangxuheng/LIBERO"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments}"
@@ -13,7 +13,7 @@ mkdir -p "$LOG_DIR"
 EVAL_TIMESTAMP="${EVAL_TIMESTAMP:-$(date +%Y_%m_%d-%H_%M_%S)}"
 SHELL_LOG="${SHELL_LOG:-$LOG_DIR/test_libero_shell_${EVAL_TIMESTAMP}_${RUN_NAME_FOR_LOG}.log}"
 
-OUTPUT_ROOT_DIR="${LAST05_ROOT}/exp_cosmos_vla_3expert"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial}"
 RUN_NAME="${RUN_NAME:-cosmos2B_janus1B_2expert_spatial_token_no_tr}"
 RUN_NAME_PREFIX="cosmos2B_janus1B_3expert"
 EVAL_RUN_NAME="$RUN_NAME"
@@ -69,7 +69,7 @@ else
     exit 1
   fi
 fi
-JANUS_MODEL_PATH="/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
 ACTION_MODEL_PATH="/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr"
 COSMOS_MODEL_PATH="/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt"
 COSMOS_EXPERIMENT_NAME="Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only"

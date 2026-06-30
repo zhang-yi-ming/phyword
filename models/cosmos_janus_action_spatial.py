@@ -72,6 +72,9 @@ class MoTAttentionWrapper2(nn.Module):
         self.cached_k_v = None
         self.cached_v_v = None
         self.cached_video_grid_thw = None
+        self.cached_k_a_prefix = None
+        self.cached_v_a_prefix = None
+        self.cached_action_prefix_valid_mask = None
         self.detach_video_kv = False
 
         if self.interleave_video_qk:
@@ -208,6 +211,41 @@ class MoTAttentionWrapper2(nn.Module):
         batch_mask[:, :, S_v:] &= action_valid_mask[:, None, :]
         return batch_mask.unsqueeze(1)
 
+    def _build_action_cached_suffix_mask(
+        self,
+        S_v: int,
+        S_prefix: int,
+        S_suffix: int,
+        device: torch.device,
+        prefix_valid_mask: Optional[torch.Tensor] = None,
+        suffix_valid_mask: Optional[torch.Tensor] = None,
+        action_tail_token_count: int = 0,
+    ):
+        total_action = S_prefix + S_suffix
+        full_self = self._build_action_self_mask(
+            total_action,
+            device,
+            action_tail_token_count=action_tail_token_count,
+        )
+        suffix_self = full_self[S_prefix:, :]
+        mask = torch.ones(S_suffix, S_v + total_action, dtype=torch.bool, device=device)
+        mask[:, S_v:] = suffix_self
+
+        batch_size = None
+        if prefix_valid_mask is not None:
+            batch_size = int(prefix_valid_mask.shape[0])
+        if suffix_valid_mask is not None:
+            batch_size = int(suffix_valid_mask.shape[0]) if batch_size is None else batch_size
+        if batch_size is None:
+            return mask.unsqueeze(0).unsqueeze(0)
+
+        batch_mask = mask.unsqueeze(0).expand(batch_size, -1, -1).clone()
+        if prefix_valid_mask is not None and S_prefix > 0:
+            batch_mask[:, :, S_v:S_v + S_prefix] &= prefix_valid_mask.to(device=device, dtype=torch.bool)[:, None, :]
+        if suffix_valid_mask is not None and S_suffix > 0:
+            batch_mask[:, :, S_v + S_prefix:] &= suffix_valid_mask.to(device=device, dtype=torch.bool)[:, None, :]
+        return batch_mask.unsqueeze(1)
+
     @staticmethod
     def _apply_action_rotary(q_a, k_a, rotary_payload: Optional[BridgeRotaryPayload]):
         if q_a is None or k_a is None:
@@ -299,6 +337,105 @@ class MoTAttentionWrapper2(nn.Module):
             query_valid_mask = torch.ones((q_a.shape[0], S_a), device=q_a.device, dtype=torch.bool)
         result = self._bridge_sdpa(q_a, k, v, attn_mask=mask, query_valid_mask=query_valid_mask)
         return self.action_bridge.post_attention(x_action, result, token_valid_mask=action_valid_mask)
+
+    def forward_action_prefix_and_cache(
+        self,
+        x_action: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor] = None,
+        rotary_payload: Optional[BridgeRotaryPayload] = None,
+        action_tail_token_count: int = 0,
+        append_to_cache: bool = False,
+    ) -> torch.Tensor:
+        if self.cached_k_v is None or self.cached_v_v is None:
+            raise RuntimeError("forward_action_prefix_and_cache requires cached Cosmos KV from run_cosmos_once().")
+
+        q_a, k_a, v_a = self.action_bridge.get_branch_qkv(x_action)
+        q_a, k_a = self._apply_action_rotary(q_a, k_a, rotary_payload)
+
+        S_v = self.cached_k_v.shape[1]
+        S_a = q_a.shape[1]
+        if append_to_cache and self.cached_k_a_prefix is not None:
+            prefix_len = self.cached_k_a_prefix.shape[1]
+            k = torch.cat([self.cached_k_v, self.cached_k_a_prefix, k_a], dim=1)
+            v = torch.cat([self.cached_v_v, self.cached_v_a_prefix, v_a], dim=1)
+            mask = self._build_action_cached_suffix_mask(
+                S_v,
+                prefix_len,
+                S_a,
+                q_a.device,
+                prefix_valid_mask=self.cached_action_prefix_valid_mask,
+                suffix_valid_mask=action_valid_mask,
+                action_tail_token_count=action_tail_token_count,
+            )
+        else:
+            prefix_len = 0
+            k = torch.cat([self.cached_k_v, k_a], dim=1)
+            v = torch.cat([self.cached_v_v, v_a], dim=1)
+            mask = self._build_action_only_mask(
+                S_v,
+                S_a,
+                q_a.device,
+                action_valid_mask=action_valid_mask,
+                action_tail_token_count=action_tail_token_count,
+            )
+
+        query_valid_mask = action_valid_mask
+        if query_valid_mask is None:
+            query_valid_mask = torch.ones((q_a.shape[0], S_a), device=q_a.device, dtype=torch.bool)
+        result = self._bridge_sdpa(q_a, k, v, attn_mask=mask, query_valid_mask=query_valid_mask)
+        out = self.action_bridge.post_attention(x_action, result, token_valid_mask=action_valid_mask)
+
+        if append_to_cache:
+            k_store = k_a.detach()
+            v_store = v_a.detach()
+            valid_store = query_valid_mask.detach().clone()
+            if self.cached_k_a_prefix is None:
+                self.cached_k_a_prefix = k_store
+                self.cached_v_a_prefix = v_store
+                self.cached_action_prefix_valid_mask = valid_store
+            else:
+                self.cached_k_a_prefix = torch.cat([self.cached_k_a_prefix, k_store], dim=1)
+                self.cached_v_a_prefix = torch.cat([self.cached_v_a_prefix, v_store], dim=1)
+                self.cached_action_prefix_valid_mask = torch.cat(
+                    [self.cached_action_prefix_valid_mask, valid_store],
+                    dim=1,
+                )
+        return out
+
+    def forward_action_suffix_only(
+        self,
+        x_action_suffix: torch.Tensor,
+        suffix_valid_mask: Optional[torch.Tensor] = None,
+        rotary_payload: Optional[BridgeRotaryPayload] = None,
+        action_tail_token_count: int = 0,
+    ) -> torch.Tensor:
+        if self.cached_k_v is None or self.cached_v_v is None:
+            raise RuntimeError("forward_action_suffix_only requires cached Cosmos KV from run_cosmos_once().")
+        if self.cached_k_a_prefix is None or self.cached_v_a_prefix is None:
+            raise RuntimeError("forward_action_suffix_only requires cached action prefix KV.")
+
+        q_a, k_a, v_a = self.action_bridge.get_branch_qkv(x_action_suffix)
+        q_a, k_a = self._apply_action_rotary(q_a, k_a, rotary_payload)
+
+        S_v = self.cached_k_v.shape[1]
+        S_prefix = self.cached_k_a_prefix.shape[1]
+        S_suffix = q_a.shape[1]
+        k = torch.cat([self.cached_k_v, self.cached_k_a_prefix, k_a], dim=1)
+        v = torch.cat([self.cached_v_v, self.cached_v_a_prefix, v_a], dim=1)
+        mask = self._build_action_cached_suffix_mask(
+            S_v,
+            S_prefix,
+            S_suffix,
+            q_a.device,
+            prefix_valid_mask=self.cached_action_prefix_valid_mask,
+            suffix_valid_mask=suffix_valid_mask,
+            action_tail_token_count=action_tail_token_count,
+        )
+        query_valid_mask = suffix_valid_mask
+        if query_valid_mask is None:
+            query_valid_mask = torch.ones((q_a.shape[0], S_suffix), device=q_a.device, dtype=torch.bool)
+        result = self._bridge_sdpa(q_a, k, v, attn_mask=mask, query_valid_mask=query_valid_mask)
+        return self.action_bridge.post_attention(x_action_suffix, result, token_valid_mask=suffix_valid_mask)
 
 
 class CosmosJanusActionSpatialMoT2Expert(nn.Module):
@@ -540,10 +677,31 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             wrapper.cached_k_v = None
             wrapper.cached_v_v = None
             wrapper.cached_video_grid_thw = None
+            wrapper.cached_k_a_prefix = None
+            wrapper.cached_v_a_prefix = None
+            wrapper.cached_action_prefix_valid_mask = None
             wrapper.current_rotary_payload = None
             wrapper.current_cache_video_kv = False
             wrapper.current_cache_video_kv_detach = True
             wrapper.current_action_tail_token_count = 0
+
+    def _clear_cached_action_prefix_kv(self):
+        for wrapper in self.mot_attention_wrappers:
+            wrapper.cached_k_a_prefix = None
+            wrapper.cached_v_a_prefix = None
+            wrapper.cached_action_prefix_valid_mask = None
+
+    def _get_cached_action_prefix_valid_mask(self) -> torch.Tensor:
+        for wrapper in self.mot_attention_wrappers:
+            if wrapper.cached_action_prefix_valid_mask is not None:
+                return wrapper.cached_action_prefix_valid_mask
+        raise RuntimeError("No cached action prefix KV is available.")
+
+    def _get_cached_action_prefix_len(self) -> int:
+        for wrapper in self.mot_attention_wrappers:
+            if wrapper.cached_k_a_prefix is not None:
+                return int(wrapper.cached_k_a_prefix.shape[1])
+        return 0
 
     def _latent_num_frames_for_pixels(self, pixel_frames: int) -> int:
         pixel_frames = int(pixel_frames)
@@ -843,6 +1001,61 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             batch_size=batch_size,
             latent_seq_len=action_seq_len,
             action_seq_len=0,
+            device=device,
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def _slice_bridge_rotary_payload(
+        rotary_payload: BridgeRotaryPayload,
+        start: int,
+        end: int,
+    ) -> BridgeRotaryPayload:
+        start = int(start)
+        end = int(end)
+
+        def maybe_slice(tensor):
+            if tensor is None:
+                return None
+            return tensor[:, start:end]
+
+        return BridgeRotaryPayload(
+            latent_cos=maybe_slice(rotary_payload.latent_cos),
+            latent_sin=maybe_slice(rotary_payload.latent_sin),
+            action_cos=maybe_slice(rotary_payload.action_cos),
+            action_sin=maybe_slice(rotary_payload.action_sin),
+        )
+
+    def _build_action_rotary_payload_for_length(
+        self,
+        batch_size: int,
+        total_action_len: int,
+        action_valid_mask: Optional[torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+        janus_left_pad_lens: Optional[torch.Tensor] = None,
+        janus_images_seq_mask: Optional[torch.Tensor] = None,
+        janus_images_emb_mask: Optional[torch.Tensor] = None,
+    ) -> BridgeRotaryPayload:
+        dummy_action = torch.empty(
+            (batch_size, int(total_action_len), self.janus_dim),
+            device=device,
+            dtype=dtype,
+        )
+        cached_video_grid_thw = None
+        if is_multimodal_bridge_pos_scheme(self.bridge_pos_scheme):
+            cached_video_grid_thw = self._get_cached_bridge_video_grid_thw(batch_size, device)
+        rotary_info = self._build_action_rotary_batch_info(
+            x_action=dummy_action,
+            action_valid_mask=action_valid_mask,
+            janus_left_pad_lens=janus_left_pad_lens,
+            janus_images_seq_mask=janus_images_seq_mask,
+            janus_images_emb_mask=janus_images_emb_mask,
+            video_grid_thw=cached_video_grid_thw,
+        )
+        return self._build_bridge_rotary_payload(
+            rotary_info,
+            action_seq_len=int(total_action_len),
             device=device,
             dtype=dtype,
         )
@@ -1167,6 +1380,112 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         return spatial_embeds
 
     @torch.no_grad()
+    def generate_spatial_tokens_cached(
+        self,
+        context_embeds: torch.Tensor,
+        num_spatial_tokens: Optional[int] = None,
+        janus_left_pad_lens: Optional[torch.Tensor] = None,
+        janus_attention_mask: Optional[torch.Tensor] = None,
+        janus_images_seq_mask: Optional[torch.Tensor] = None,
+        janus_images_emb_mask: Optional[torch.Tensor] = None,
+        return_spatial_debug: bool = False,
+    ):
+        num_spatial_tokens = self._resolve_spatial_token_count(num_spatial_tokens)
+        self._clear_cached_action_prefix_kv()
+        context_embeds = context_embeds.to(self.dtype)
+        B = context_embeds.shape[0]
+        device = context_embeds.device
+        if janus_left_pad_lens is not None:
+            janus_left_pad_lens = janus_left_pad_lens.to(device=device, dtype=torch.long)
+        if janus_attention_mask is not None:
+            janus_attention_mask = janus_attention_mask.to(device=device, dtype=torch.bool)
+
+        x_context, context_valid_mask = self._build_action_sequence(
+            context_embeds=context_embeds,
+            janus_left_pad_lens=janus_left_pad_lens,
+            janus_attention_mask=janus_attention_mask,
+        )
+        context_rotary_payload = self._build_action_rotary_payload_for_length(
+            batch_size=B,
+            total_action_len=x_context.shape[1],
+            action_valid_mask=context_valid_mask,
+            device=device,
+            dtype=x_context.dtype,
+            janus_left_pad_lens=janus_left_pad_lens,
+            janus_images_seq_mask=janus_images_seq_mask,
+            janus_images_emb_mask=janus_images_emb_mask,
+        )
+        hidden = x_context
+        for wrapper in self.mot_attention_wrappers:
+            hidden = wrapper.forward_action_prefix_and_cache(
+                hidden,
+                action_valid_mask=context_valid_mask,
+                rotary_payload=context_rotary_payload,
+                action_tail_token_count=0,
+                append_to_cache=True,
+            )
+        hidden_norm = self.janus.language_model.model.norm(hidden)
+        anchor_idx = self._last_valid_context_indices(context_valid_mask, context_embeds.shape[1])
+        last_anchor_hidden = hidden_norm[torch.arange(B, device=device), anchor_idx]
+
+        spatial_parts = []
+        last_prediction_anchor_hidden = last_anchor_hidden
+        last_token_ids = None
+        for _ in range(num_spatial_tokens):
+            last_prediction_anchor_hidden = last_anchor_hidden
+            logits = self.janus.language_model.lm_head(last_anchor_hidden)
+            if self.valid_token_vocab_size is not None and self.valid_token_vocab_size < logits.shape[-1]:
+                logits = logits[..., :self.valid_token_vocab_size]
+            token_ids = logits.argmax(dim=-1)
+            token_embeds = self._embed_janus_token_ids(token_ids.unsqueeze(1)).to(self.dtype)
+            spatial_parts.append(token_embeds)
+            last_token_ids = token_ids
+
+            prefix_len = self._get_cached_action_prefix_len()
+            token_valid_mask = torch.ones((B, 1), device=device, dtype=torch.bool)
+            full_valid_mask = torch.cat(
+                [
+                    self._get_cached_action_prefix_valid_mask().to(device=device, dtype=torch.bool),
+                    token_valid_mask,
+                ],
+                dim=1,
+            )
+            full_rotary_payload = self._build_action_rotary_payload_for_length(
+                batch_size=B,
+                total_action_len=prefix_len + 1,
+                action_valid_mask=full_valid_mask,
+                device=device,
+                dtype=token_embeds.dtype,
+                janus_left_pad_lens=janus_left_pad_lens,
+                janus_images_seq_mask=janus_images_seq_mask,
+                janus_images_emb_mask=janus_images_emb_mask,
+            )
+            token_rotary_payload = self._slice_bridge_rotary_payload(
+                full_rotary_payload,
+                prefix_len,
+                prefix_len + 1,
+            )
+            token_hidden = token_embeds
+            for wrapper in self.mot_attention_wrappers:
+                token_hidden = wrapper.forward_action_prefix_and_cache(
+                    token_hidden,
+                    action_valid_mask=token_valid_mask,
+                    rotary_payload=token_rotary_payload,
+                    action_tail_token_count=0,
+                    append_to_cache=True,
+                )
+            token_hidden_norm = self.janus.language_model.model.norm(token_hidden)
+            last_anchor_hidden = token_hidden_norm[:, -1, :]
+
+        spatial_embeds = torch.cat(spatial_parts, dim=1)
+        if return_spatial_debug:
+            return spatial_embeds, {
+                "spatial_anchor_hidden": last_prediction_anchor_hidden.detach(),
+                "spatial_token_ids": last_token_ids.detach(),
+            }
+        return spatial_embeds
+
+    @torch.no_grad()
     def action_denoise_step(
         self,
         action_latent: torch.Tensor,
@@ -1220,6 +1539,63 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 hidden,
                 action_valid_mask=action_valid_mask,
                 rotary_payload=rotary_payload,
+                action_tail_token_count=action_latent.shape[1],
+            )
+        hidden_norm = self.janus.language_model.model.norm(hidden)
+        action_out = hidden_norm[:, -action_latent.shape[1]:, :]
+        return self.janus.final_layer(action_out)
+
+    @torch.no_grad()
+    def action_denoise_step_cached(
+        self,
+        action_latent: torch.Tensor,
+        timestep_act: torch.Tensor,
+        janus_left_pad_lens: Optional[torch.Tensor] = None,
+        janus_images_seq_mask: Optional[torch.Tensor] = None,
+        janus_images_emb_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        action_latent = action_latent.to(self.dtype)
+        B = action_latent.shape[0]
+        device = action_latent.device
+        prefix_len = self._get_cached_action_prefix_len()
+        if prefix_len <= 0:
+            raise RuntimeError("action_denoise_step_cached requires cached action prefix KV.")
+        if janus_left_pad_lens is not None:
+            janus_left_pad_lens = janus_left_pad_lens.to(device=device, dtype=torch.long)
+
+        time_tokens = self.janus.t_embedder(timestep_act).unsqueeze(1).to(dtype=self.dtype)
+        action_tokens = self.janus.x_embedder(action_latent.to(dtype=self.dtype))
+        suffix = torch.cat([time_tokens, action_tokens], dim=1)
+        suffix_valid_mask = torch.ones((B, suffix.shape[1]), device=device, dtype=torch.bool)
+        full_valid_mask = torch.cat(
+            [
+                self._get_cached_action_prefix_valid_mask().to(device=device, dtype=torch.bool),
+                suffix_valid_mask,
+            ],
+            dim=1,
+        )
+        total_len = prefix_len + suffix.shape[1]
+        full_rotary_payload = self._build_action_rotary_payload_for_length(
+            batch_size=B,
+            total_action_len=total_len,
+            action_valid_mask=full_valid_mask,
+            device=device,
+            dtype=suffix.dtype,
+            janus_left_pad_lens=janus_left_pad_lens,
+            janus_images_seq_mask=janus_images_seq_mask,
+            janus_images_emb_mask=janus_images_emb_mask,
+        )
+        suffix_rotary_payload = self._slice_bridge_rotary_payload(
+            full_rotary_payload,
+            prefix_len,
+            total_len,
+        )
+        hidden = suffix
+        for wrapper in self.mot_attention_wrappers:
+            hidden = wrapper.forward_action_suffix_only(
+                hidden,
+                suffix_valid_mask=suffix_valid_mask,
+                rotary_payload=suffix_rotary_payload,
                 action_tail_token_count=action_latent.shape[1],
             )
         hidden_norm = self.janus.language_model.model.norm(hidden)
@@ -1676,7 +2052,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                     )[0].to(self.dtype)
                     x_vid[:, :, :T_cond] = condition_latent
 
-            spatial_result = self.generate_spatial_tokens(
+            spatial_result = self.generate_spatial_tokens_cached(
                 context_embeds=context_embeds,
                 num_spatial_tokens=num_spatial_tokens,
                 janus_left_pad_lens=janus_left_pad_lens,
@@ -1696,13 +2072,10 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             for step in range(action_denoise_steps):
                 t = 1.0 - step * dt
                 t_act = torch.full((B,), t, device=device, dtype=self.dtype)
-                pred_act_v = self.action_denoise_step(
+                pred_act_v = self.action_denoise_step_cached(
                     action_latent=x_act,
-                    spatial_token_embeds=spatial_embeds,
-                    context_embeds=context_embeds,
                     timestep_act=t_act,
                     janus_left_pad_lens=janus_left_pad_lens,
-                    janus_attention_mask=janus_attention_mask,
                     janus_images_seq_mask=janus_images_seq_mask,
                     janus_images_emb_mask=janus_images_emb_mask,
                 )

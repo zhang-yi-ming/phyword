@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 
-LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05}"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
 COSMOS_ROOT="${COSMOS_ROOT:-/mnt/nas/zhangyiming/experiments}"
 LIBERO_ROOT="${LIBERO_ROOT:-/mnt/nas/zhangxuheng/LIBERO}"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments_new}"
@@ -14,9 +14,9 @@ RUN_ID_NOTE="${RUN_ID_NOTE:-}"
 EVAL_TIMESTAMP="$RUN_STAMP"
 SHELL_LOG="$LOG_DIR/test_libero_shell_${EVAL_TIMESTAMP}.log"
 
-OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_cosmos_vla_3expert}"
-RUN_NAME="${RUN_NAME:-cosmos2B_janus1B_3expert_baseline}"
-RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-cosmos2B_janus1B_3expert}"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial}"
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
+RUN_NAME_PREFIX="${RUN_NAME_PREFIX:-cosmos2B_action1B_mot2}"
 EVAL_RUN_NAME="$RUN_NAME"
 if [[ "$EVAL_RUN_NAME" == "$RUN_NAME_PREFIX"* ]]; then
   EVAL_RUN_NAME="${EVAL_RUN_NAME#"$RUN_NAME_PREFIX"}"
@@ -31,7 +31,7 @@ PRED_VIDEO_DIR="${PRED_VIDEO_DIR:-${EXPERIMENTS_ROOT}/predict/${EVAL_ARTIFACT_NA
 ROLLOUT_VIDEO_DIR="${ROLLOUT_VIDEO_DIR:-${EXPERIMENTS_ROOT}/rollouts/${EVAL_ARTIFACT_NAME}}"
 VALUE_VIS_DIR="${VALUE_VIS_DIR:-${EXPERIMENTS_ROOT}/value_visualizations/${EVAL_ARTIFACT_NAME}}"
 BASH_HPARAMS_FILE="${LOG_DIR}/test_libero_hparams_${EVAL_ARTIFACT_NAME}.env"
-CHECKPOINT_NAME="${CHECKPOINT_NAME:-checkpoint-epoch-29-step-25470}"
+CHECKPOINT_NAME="${CHECKPOINT_NAME:-}"
 COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_raw_full_concat}"
 #COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache}"
 #COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_rewritten_prompts_raw_full_concat}"
@@ -62,13 +62,13 @@ else
     exit 1
   fi
 fi
-JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B}"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
 ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
 COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 
 # Bridge position schemes: mrope, mrope_interleave, llama1d
-BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
+BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-llama1d}"
 IMG_LATENTS_PER_FUTURE="${IMG_LATENTS_PER_FUTURE:-0}"
 STATE_LATENTS_PER_FUTURE="${STATE_LATENTS_PER_FUTURE:-0}"
 NUM_FUTURE_FRAMES="${NUM_FUTURE_FRAMES:-0}"
@@ -81,12 +81,12 @@ ACTION_INTERMEDIATE_SIZE="${ACTION_INTERMEDIATE_SIZE:-0}"
 ACTION_USE_LATENT_PREFIX="${ACTION_USE_LATENT_PREFIX:-true}"
 DECOSMOS="${DECOSMOS:-false}"
 
-COSMOS_SELF_ONLY_BRIDGE="${COSMOS_SELF_ONLY_BRIDGE:-true}"
-ACTION_SELF_CAUSAL_IN_BRIDGE="${ACTION_SELF_CAUSAL_IN_BRIDGE:-false}"
+COSMOS_SELF_ONLY_BRIDGE="${COSMOS_SELF_ONLY_BRIDGE:-false}"
+ACTION_SELF_CAUSAL_IN_BRIDGE="${ACTION_SELF_CAUSAL_IN_BRIDGE:-true}"
 
 TASK_SUITE_NAME="${TASK_SUITE_NAME:-libero_spatial}"
-VIDEO_FRAMES="${VIDEO_FRAMES:-17}"
-NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-5}"
+VIDEO_FRAMES="${VIDEO_FRAMES:-1}"
+NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-1}"
 ACTION_CHUNK="${ACTION_CHUNK:-16}"
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
 SEED="${SEED:-0}"

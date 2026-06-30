@@ -2,20 +2,20 @@
 set -Eeuo pipefail
 
 
-LAST05_ROOT="/mnt/nas/zhangyiming/last05_beta/last05"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
 COSMOS_ROOT="/mnt/nas/zhangyiming/experiments"
 LIBERO_ROOT="/mnt/nas/zhangxuheng/LIBERO"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments}"
 
-RUN_NAME_FOR_LOG="${RUN_NAME:-cosmos2B_janus1B_2expert_spatial_token_no_tr}"
+RUN_NAME_FOR_LOG="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
 LOG_DIR="${EXPERIMENTS_ROOT}/shell"
 mkdir -p "$LOG_DIR"
 EVAL_TIMESTAMP="${EVAL_TIMESTAMP:-$(date +%Y_%m_%d-%H_%M_%S)}"
 SHELL_LOG="${SHELL_LOG:-$LOG_DIR/test_libero_shell_${EVAL_TIMESTAMP}_${RUN_NAME_FOR_LOG}.log}"
 
-OUTPUT_ROOT_DIR="${LAST05_ROOT}/exp_cosmos_vla_3expert"
-RUN_NAME="${RUN_NAME:-cosmos2B_janus1B_2expert_spatial_token_no_tr}"
-RUN_NAME_PREFIX="cosmos2B_janus1B_3expert"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial}"
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
+RUN_NAME_PREFIX="cosmos2B_action1B_mot2"
 EVAL_RUN_NAME="$RUN_NAME"
 if [[ "$EVAL_RUN_NAME" == "$RUN_NAME_PREFIX"* ]]; then
   EVAL_RUN_NAME="${EVAL_RUN_NAME#"$RUN_NAME_PREFIX"}"
@@ -30,7 +30,7 @@ PRED_VIDEO_DIR="${EXPERIMENTS_ROOT}/predict/${EVAL_ARTIFACT_NAME}"
 ROLLOUT_VIDEO_DIR="${EXPERIMENTS_ROOT}/rollouts/${EVAL_ARTIFACT_NAME}"
 VALUE_VIS_DIR="${EXPERIMENTS_ROOT}/value_visualizations/${EVAL_ARTIFACT_NAME}"
 BASH_HPARAMS_FILE="${LOG_DIR}/test_libero_hparams_${EVAL_ARTIFACT_NAME}.env"
-CHECKPOINT_NAME="${CHECKPOINT_NAME:-checkpoint-epoch-19-step-16980}"
+CHECKPOINT_NAME="${CHECKPOINT_NAME:-}"
 COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-}"
 LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${EXPERIMENTS_ROOT}/logs}"
 RUN_ID_NOTE="${RUN_ID_NOTE:-${EVAL_ARTIFACT_NAME}}"
@@ -64,13 +64,13 @@ else
     exit 1
   fi
 fi
-JANUS_MODEL_PATH="/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B"
-ACTION_MODEL_PATH="/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr"
-COSMOS_MODEL_PATH="/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt"
-COSMOS_EXPERIMENT_NAME="Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
+COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 
 # Bridge position schemes: mrope, mrope_interleave, llama1d
-BRIDGE_POS_SCHEME="llama1d"
+BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-llama1d}"
 IMG_LATENTS_PER_FUTURE=0
 STATE_LATENTS_PER_FUTURE=0
 NUM_FUTURE_FRAMES=0
@@ -81,9 +81,9 @@ STATE_PLACEHOLDER_TOKENS=8
 STATE_ENCODING_MODE="mlp"
 ACTION_INTERMEDIATE_SIZE=0
 ACTION_USE_LATENT_PREFIX="true"
-DECOSMOS="true"
+DECOSMOS="false"
 
-COSMOS_SELF_ONLY_BRIDGE="true"
+COSMOS_SELF_ONLY_BRIDGE="false"
 ACTION_SELF_CAUSAL_IN_BRIDGE="true"
 
 TASK_SUITE_NAME="libero_spatial"

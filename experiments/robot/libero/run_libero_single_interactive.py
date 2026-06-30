@@ -46,6 +46,7 @@ from experiments.robot.libero.run_libero_eval_new import (  # noqa: E402
     JANUS_ACTION_PROMPT_SUFFIX,
     GenerateConfig,
     TASK_MAX_STEPS,
+    build_token_sequence_mask,
     build_eval_state_inputs,
     coerce_bool,
     load_initial_states,
@@ -581,14 +582,22 @@ class SingleLiberoInteractiveRunner:
                 self.trajectory_camera_config,
             )
         janus_inputs = self.processor(prompt=prompt_text, images=[janus_primary_image], return_tensors="pt")
+        cosmos_user_content = f"<image_placeholder>\n{eval_prompt}"
+        if state_tokens_str:
+            cosmos_user_content += f"\n{state_tokens_str}"
+        cosmos_user_prompt = self.processor.apply_sft_template_for_multi_turn_prompts(
+            conversations=[{"role": "<|User|>", "content": cosmos_user_content}],
+            sft_format=self.processor.sft_format,
+            system_prompt="",
+        )
+        cosmos_prompt_text = cosmos_user_prompt + "\n\n<|Assistant|>:"
+        cosmos_janus_inputs = self.processor(prompt=cosmos_prompt_text, images=[janus_primary_image], return_tensors="pt")
 
         janus_input_ids = janus_inputs.input_ids.to(device)
         janus_pixel_values = janus_inputs.pixel_values.to(device).to(dtype)
         janus_images_seq_mask = janus_inputs.images_seq_mask.to(device)
         janus_state_seq_mask = torch.zeros_like(janus_input_ids, dtype=torch.bool, device=device)
         if state_placeholder_ids is not None:
-            from models.cosmos_janus_cot import build_token_sequence_mask
-
             janus_state_seq_mask = build_token_sequence_mask(
                 janus_input_ids,
                 state_placeholder_ids,
@@ -602,10 +611,13 @@ class SingleLiberoInteractiveRunner:
             janus_attention_mask = janus_inputs.attention_mask.to(device).to(torch.bool)
         pad_token_id = resolve_pad_token_id(self.processor)
         janus_left_pad_lens = janus_input_ids.eq(pad_token_id).to(torch.long).cumprod(dim=1).sum(dim=1)
-        janus_action_pixel_values = self.processor.image_processor(
-            [wrist_image],
-            return_tensors="pt",
-        )["pixel_values"].unsqueeze(0).to(device).to(dtype)
+        cosmos_janus_input_ids = cosmos_janus_inputs.input_ids.to(device)
+        cosmos_janus_state_seq_mask = build_token_sequence_mask(
+            cosmos_janus_input_ids,
+            state_placeholder_ids,
+            require_match=bool(int(getattr(cfg, "robot_state", 0) or 0)),
+            name="current state placeholder in Cosmos prompt",
+        ).to(device)
 
         first_frame_tensor = torch.stack(list(obs_history), dim=1).unsqueeze(0).to(device).to(dtype)
         cosmos_text_embeddings = self.cosmos_text_embeddings(cfg, eval_prompt, device, dtype)
@@ -624,22 +636,18 @@ class SingleLiberoInteractiveRunner:
                 num_latent_tokens=cfg.total_latent_tokens,
                 janus_left_pad_lens=janus_left_pad_lens,
                 janus_state_seq_mask=janus_state_seq_mask,
-                janus_action_pixel_values=janus_action_pixel_values,
                 janus_attention_mask=janus_attention_mask,
                 now_state=now_state,
                 cosmos_text_embeddings=cosmos_text_embeddings,
-                return_value_prediction=cfg.use_value_prediction,
-                return_action_value_prediction=cfg.use_action_value_prediction,
+                cosmos_janus_input_ids=cosmos_janus_input_ids,
+                cosmos_janus_images_seq_mask=cosmos_janus_inputs.images_seq_mask.to(device),
+                cosmos_janus_state_seq_mask=cosmos_janus_state_seq_mask,
+                cosmos_janus_images_emb_mask=cosmos_janus_inputs.images_emb_mask.to(device),
             )
 
         predicted_value = None
         predicted_action_value = None
-        if cfg.use_action_value_prediction:
-            pred_video, pred_action, predicted_value, predicted_action_value = inference_outputs
-        elif cfg.use_value_prediction:
-            pred_video, pred_action, predicted_value = inference_outputs
-        else:
-            pred_video, pred_action = inference_outputs
+        pred_video, pred_action = inference_outputs[:2]
 
         cosmos_value_score = None
         action_value_score = None
