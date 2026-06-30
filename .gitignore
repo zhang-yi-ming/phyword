@@ -1,0 +1,17 @@
+training_data
+.DS_Store
+exp_*
+exp_pretrain
+ckpts
+exp_cosmos_vla
+experiments/logs
+LIFT3D
+cosmos_predict2_5
+test_results
+rollouts
+*.log
+*.mp4
+*.png
+__pycache__/
+*.pyc
+checkpoint_*

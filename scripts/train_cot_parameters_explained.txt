@@ -1,0 +1,401 @@
+train_cot.sh 参数说明
+=====================
+
+本文档对应同目录下的 train_cot.sh，用于解释脚本中每个变量和传给
+train_cot.py 的每个命令行参数的作用。
+
+
+1. Shell 行为与运行环境
+----------------------
+
+#!/bin/bash
+    使用 bash 解释执行该脚本。
+
+set -e
+    任意命令返回非 0 退出码时立即终止脚本，避免后续训练在错误环境下继续运行。
+
+# export http_proxy=... && export https_proxy=...
+    可选代理配置。当前被注释，不生效。需要联网下载依赖或访问外部服务时可按需打开。
+
+LAST05_ROOT="/mnt/nas/zhangyiming/last05_beta/last05"
+    项目根目录。脚本会进入 ${LAST05_ROOT}/scripts 后启动训练。
+    评估/训练脚本中的相对路径通常以这个项目根目录为基准。
+
+cd "${LAST05_ROOT}/scripts"
+    切换到 scripts 目录运行 train_cot.py。这样 ../config/sft.yaml、
+    ../exp_cosmos_vla_844 等相对路径能按脚本预期解析。
+
+source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
+    激活名为 last05 的 conda 环境。训练依赖的 torch、accelerate、Janus、Cosmos、
+    decord 等包应在该环境中。
+
+export WANDB_API_KEY=...
+    设置 Weights & Biases 账号密钥，用于在线记录训练日志。注意不要把真实 key
+    暴露到公开仓库。
+
+export PATH=/root/miniconda3/envs/last05/bin:$PATH
+    优先使用 last05 环境里的 python、accelerate 等可执行程序。
+
+# export HF_HOME=/media/huggingFace
+    可选 Hugging Face 缓存目录。当前被注释，不生效。
+
+export PYTHONPATH="${LAST05_ROOT}:/mnt/nas/zhangyiming/last05_beta/last05:${PYTHONPATH:-}"
+    把项目根目录加入 Python 模块搜索路径，确保 import models、janus、
+    cosmos_predict2 等模块时使用当前 checkout。
+
+export PATH=/media/miniconda3/envs/last05.1/bin:$PATH
+    额外把另一个 conda 环境的 bin 放到 PATH 前面。注意这会排在前一条 PATH 更新
+    之后，因此可能让 /media/miniconda3/envs/last05.1/bin 中的同名命令优先。
+
+export OMP_NUM_THREADS=4
+    每个进程使用的 OpenMP CPU 线程数。通常用于限制 dataloader / 图像处理 /
+    数值库的 CPU 线程占用，避免多 GPU 多进程时 CPU 过载。
+
+export HF_HUB_OFFLINE=1
+    让 Hugging Face 相关加载尽量使用本地缓存，避免联网访问 hub。
+
+export WANDB_MODE=online
+    W&B 在线模式。若想离线记录，可改为 offline。
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+    指定训练可见 GPU。这里暴露 8 张卡。
+
+
+2. 实验命名与输出路径
+--------------------
+
+EXPERIMENT_NAME="cosmos_janus_3expert_libero_spatial_new_debug"
+    W&B project 名称。train_cot.py 中 wandb.init(project=experiment_name, ...)
+    会使用它。
+
+RUN_NAME="cosmos2B_janus1B_3expert_cot_spatial_bs64_844_ep30_1e4_frz20"
+    本次训练 run 名称。也会用于输出目录：
+    ${OUTPUT_ROOT_DIR}/${RUN_NAME}
+
+OUTPUT_ROOT_DIR="../exp_cosmos_vla_844"
+    checkpoint、processor、train_statistics.json、W&B 本地文件等输出根目录。
+    train_cot.py 会把 output_dir 和 log_dir 都追加 run_name。
+
+
+3. 数据与预训练权重路径
+----------------------
+
+DATA_JSON="/mnt/nas/.../libero_spatial_20hz_224_dual/train.json"
+    训练数据 JSON。每个样本应包含主视角 video_path、腕部 video_action_path、
+    input_prompt、action、state、frame_index 等字段。脚本会自动读取同名的
+    *_statistics.json 来做 action/state 归一化。
+
+JANUS_MODEL_PATH="/mnt/nas/.../Janus-Pro-1B"
+    原始 Janus-Pro-1B 路径。训练中作为 latent expert base 和 VLChatProcessor /
+    tokenizer / vision encoder 的来源。
+
+ACTION_EXPERT_PATH="/mnt/nas/.../LaST0_Pretrain_AE_chunk16/tfmr"
+    action-only Janus expert checkpoint。train_cot.py 会把其中 action expert /
+    flow-matching 相关权重拷贝进 3-expert Janus 架构的 action 分支。
+
+COSMOS_PT_PATH="/mnt/nas/.../Cosmos-Predict2.5-2B/..._ema_bf16.pt"
+    Cosmos Predict2.5 2B 预训练权重文件。
+
+COSMOS_EXP_NAME="Stage-c_pt_..."
+    Cosmos 配置/实验名。load_model_from_checkpoint 会用它和 COSMOS_PT_PATH
+    共同恢复 Cosmos 模型结构与权重。
+
+
+4. 分布式与 batch 设置
+---------------------
+
+NUM_GPUS=8
+    当前脚本中没有直接使用，只是说明预期 GPU 数。实际进程数由 NUM_PROCESSES 控制。
+
+NUM_PROCESSES=8
+    accelerate 启动的训练进程数。通常等于使用的 GPU 数。
+
+TRAIN_BSZ=8
+    每张 GPU / 每个进程的 batch size，对应 --train_bsz_per_gpu。
+    当前全局有效 batch size 大约是：
+    TRAIN_BSZ * NUM_PROCESSES * GRAD_ACCUM = 8 * 8 * 1 = 64。
+
+GRAD_ACCUM=1
+    梯度累积步数，对应 --gradient_accumulation_steps。
+    设为 1 表示每个 mini-batch 都更新一次参数。
+
+NUM_WORKERS=4
+    每个进程 DataLoader worker 数。用于并行读取视频帧、图像处理、样本构造。
+
+PIN_MEMORY=1
+    DataLoader 是否 pin CPU memory。开启后 CPU 到 GPU 拷贝通常更快。
+
+PERSISTENT_WORKERS=1
+    DataLoader worker 是否跨 epoch 保持存活。num_workers > 0 时可减少 worker
+    重建开销。
+
+
+5. 学习率与优化设置
+------------------
+
+LR=1e-4
+    主学习率，对应 --learning_rate。Janus/action/bridge 等非 Cosmos-core 参数
+    使用这个基准学习率。
+
+COSMOS_CORE_LR_RATIO=0.02
+    Cosmos core 参数学习率相对 LR 的倍率，对应 --cosmos_core_lr_ratio。
+    当前 Cosmos core 学习率约为 1e-4 * 0.02 = 2e-6。
+
+--min_lr_ratio 0.05
+    cosine scheduler 最低学习率比例。学习率衰减到最低时不低于初始学习率的 5%。
+
+--warmup_rates 0.02
+    warmup 比例。总训练 step 的前 2% 做线性 warmup。
+
+--weight_decay 0
+    权重衰减。当前关闭 weight decay。
+
+--max_grad_norm
+    train_cot.sh 当前没有显式传入，因此使用 train_cot.py 默认值 1.0。
+    用于梯度裁剪。
+
+
+6. 动作专家与动作输出
+--------------------
+
+ACTION_INTERMEDIATE_SIZE=5632
+    action 分支 slim MLP 的中间层维度，对应 --action_intermediate_size。
+    必须和 action expert / checkpoint 中的 action_bridge MLP 形状匹配。
+
+--action_dim 7
+    每个动作向量维度。LIBERO 中通常是 3D 位移 + 3D 旋转/轴角 + 1 个夹爪维度。
+
+--action_chunk 16
+    模型一次预测的动作序列长度，即输出 actions 形状中的 T_action。
+    训练时监督 16 步动作；评测时可以只执行前 num_open_loop_steps 步。
+
+--action_self_causal_in_bridge 0
+    action 分支内部 action token 之间的注意力是否 causal。
+    0 表示双向可见，适合 flow matching 并行生成一整个 action chunk；
+    1 表示 action token 间 causal。
+
+
+7. 当前状态输入与状态编码
+------------------------
+
+ROBOT_STATE=1
+    是否使用当前机器人状态。1 表示启用 state 输入；0 表示不把当前 state 放进
+    prompt / Janus context / action prefix。
+
+STATE_PLACEHOLDER_TOKENS=8
+    prompt 中为当前 state 预留的 placeholder token 数。
+    token 模式下必须等于 ActionTokenizer 编码当前 state 后得到的 token 数。
+    当前 token 模式使用 8。
+
+STATE_ENCODING_MODE="token"
+    当前状态编码方式，对应 --state_encoding_mode。
+    token: 归一化 state -> ActionTokenizer -> tokenizer ids -> token embedding。
+    mlp: 归一化 float state 直接过模型内的 state_mlp_embedder，要求 state 维度为 8，
+         且 robot_state=1 时 STATE_PLACEHOLDER_TOKENS 必须为 1。
+
+STATE_LATENTS_PER_FUTURE=1
+    latent CoT 监督中，每个未来时间点使用几个 state latent token。
+    token 模式下会把未来 state 的 token embeddings 压缩到这个数量；
+    mlp 模式下要求该值为 1。
+
+
+8. 未来 latent CoT 设置
+----------------------
+
+IMG_LATENTS_PER_FUTURE=1
+    每个未来时间点用几个图像 latent token 作为 latent CoT 监督。
+
+NUM_FUTURE_FRAMES=4
+    每个样本取多少个未来时间点用于 latent CoT ground truth。
+
+FUTURE_FRAME_STRIDE=8
+    未来帧间隔。假设当前 frame_index 为 t，则未来图像/state 约取：
+    t+8, t+16, t+24, t+32。
+
+TOTAL_LATENT_TOKENS=$((NUM_FUTURE_FRAMES * (IMG_LATENTS_PER_FUTURE + STATE_LATENTS_PER_FUTURE)))
+    总 latent CoT token 数。当前为：
+    4 * (1 + 1) = 8。
+    train_cot.py 会校验 total_latent_tokens 必须等于这个公式。
+
+--total_latent_tokens
+    latent 分支需要监督/生成的 token 总数。
+
+--img_latents_per_future
+    每个未来时间点的图像 latent token 数。
+
+--state_latents_per_future
+    每个未来时间点的 state latent token 数。
+
+--num_future_frames
+    未来时间点数量。
+
+--future_frame_stride
+    未来时间点采样间隔。
+
+
+9. 图像、视频与 FPS 设置
+----------------------
+
+--video_h 256
+    Cosmos 视频输入高度。训练数据视频帧会 Resize + CenterCrop 到 256 高。
+
+--video_w 256
+    Cosmos 视频输入宽度。训练数据视频帧会 Resize + CenterCrop 到 256 宽。
+
+--video_frames 16
+    Cosmos 视频分支一次使用的帧数。数据集中从当前帧开始读取 16 帧作为视频监督。
+
+--fps 20
+    视频帧率条件，传给 Cosmos 的 fps conditioning。应和数据采样频率一致。
+
+腕部图像分支
+    train_cot.py 会从样本的 video_action_path 读取当前 frame_index 的腕部图像，
+    通过 Janus image_processor 得到 janus_action_pixel_values，用作 action 分支
+    的 wrist image prefix。
+
+主视角 Janus 图像
+    train_cot.py 会从 video_path 读取当前 frame_index 的主视角图像，作为
+    <image_placeholder> 对应的 Janus 图像输入。
+
+
+10. Loss 与训练阶段策略
+----------------------
+
+LATENT_LOSS_WEIGHT=1.0
+    latent CoT 相似度损失权重，对应 --latent_loss_weight。
+    latent loss 通常是 1 - cosine_similarity。
+
+VIDEO_LOSS_WEIGHT=1.0
+    Cosmos 视频 velocity loss 权重，对应 --video_loss_weight。
+    如果视频分支被冻结，代码会把该项强制置为 0。
+
+ACTION_GT_LATENT_AFTER_EPOCH=-1
+    action 分支是否在某个 epoch 后切换到 teacher-forced GT latent 单次前向模式。
+    -1: 始终使用 legacy two-pass / predicted latent refill 模式。
+     0: 从第 1 个 epoch 就使用 GT latent 单次前向。
+     N: 前 N 个 epoch 使用 legacy 模式，从第 N+1 个 epoch 切换。
+
+--freeze_video_after 20
+    当 epoch >= 20 时冻结 Cosmos 视频 backbone。
+    注意 epoch 是 0-indexed，因此这里表示从第 21 个 epoch 开始冻结。
+    -1 表示永不冻结，0 表示一开始就冻结。
+
+
+11. MoT bridge 与分支解耦开关
+----------------------------
+
+COSMOS_SELF_ONLY_BRIDGE=1
+    对应 --cosmos_self_only_bridge。
+    1 表示 Cosmos/video 分支的 bridge attention 只看 video 自己的 KV，
+    不让 Cosmos query 反向看 latent/action token；latent/action 仍可按设定看 Cosmos。
+    这样可以减少 latent/action 对 Cosmos 视频分支的干扰。
+
+TRAIN_EMBED_TOKENS=1
+    对应 --train_embed_tokens。
+    1 表示 Janus token embedding / multimodal embedding 构造保留梯度，允许相关
+    embedding 参与训练；0 表示在 no_grad 下构造，节省显存并冻结这部分。
+
+DECOSMOS=0
+    对应 --decosmos。
+    0: 正常使用 Cosmos 视频分支，latent/action 可通过 bridge 看到 Cosmos video KV。
+    1: 训练 latent/action 时与 Cosmos 切断，不使用 Cosmos KV，video loss 也会置 0。
+       此时更像只训练 Janus latent/action 两个后续分支。
+
+ACTION_USE_LATENT_PREFIX=1
+    对应 --action_use_latent_prefix。
+    1 表示 action 分支额外拼接 wrist image prefix 和当前 state prefix：
+       [wrist image prefix, state prefix, time token, action tokens]。
+    0 表示 action 分支只用 time token + action tokens，不拼腕部图像/当前状态前缀。
+
+BRIDGE_POS_SCHEME="llama1d"
+    对应 --bridge_pos_scheme。
+    llama1d: 使用 Janus/Llama 风格的一维 RoPE 给 latent/action bridge QK 加位置。
+    mrope: 使用 A1/Qwen3-VL 风格的 multimodal 3D RoPE。
+    local 和 last0 是 legacy alias，会 normalize 到 mrope。
+
+
+12. accelerate launch 参数
+-------------------------
+
+accelerate launch --config_file ../config/sft.yaml
+    使用 accelerate 启动多进程训练，并读取 ../config/sft.yaml 中的分布式配置
+    （例如 DeepSpeed、mixed precision、zero stage 等）。
+
+--num_processes ${NUM_PROCESSES}
+    启动进程数。当前是 8。
+
+--num_machines 1
+    单机训练。
+
+--machine_rank 0
+    当前机器 rank。单机时固定为 0。
+
+--deepspeed_multinode_launcher standard
+    DeepSpeed 多机 launcher 类型。这里即使单机也保留 standard 设置。
+
+train_cot.py
+    实际训练入口脚本。
+
+
+13. train_cot.py 基础参数
+------------------------
+
+--experiment_name ${EXPERIMENT_NAME}
+    W&B project 名称。
+
+--run_name ${RUN_NAME}
+    W&B run 名称，同时用于 output_dir/log_dir 的子目录名。
+
+--model_path ${JANUS_MODEL_PATH}
+    Janus-Pro-1B 路径，用于 processor、tokenizer、latent expert base。
+
+--action_expert_path ${ACTION_EXPERT_PATH}
+    action-only expert 路径，用于初始化 action expert 和 flow matching 相关权重。
+
+--cosmos_model_path ${COSMOS_PT_PATH}
+    Cosmos 预训练 checkpoint 文件。
+
+--cosmos_experiment_name ${COSMOS_EXP_NAME}
+    Cosmos 实验配置名。
+
+--data_path ${DATA_JSON}
+    训练数据 JSON 路径。
+
+--output_dir ${OUTPUT_ROOT_DIR}
+    checkpoint 输出根目录。最终会变成 ${OUTPUT_ROOT_DIR}/${RUN_NAME}。
+
+--log_dir ${OUTPUT_ROOT_DIR}
+    日志输出根目录。最终会变成 ${OUTPUT_ROOT_DIR}/${RUN_NAME}。
+
+
+14. 训练时保存内容
+-----------------
+
+每到 save_freq 或最后一个 epoch，train_cot.py 会保存：
+
+cosmos_janus_mot.pt
+    当前 3-expert 模型全参 state_dict。
+
+processor 文件
+    processor.save_pretrained(save_dir) 保存的 tokenizer / processor 配置。
+
+train_statistics.json
+    从训练数据对应的 *_statistics.json 拷贝保存，用于评测时 action/state 的归一化
+    和反归一化。
+
+
+15. 当前配置的整体含义
+--------------------
+
+当前脚本配置为：
+
+- 8 GPU 训练，每卡 batch size 8，全局 batch size 64。
+- 训练 LIBERO spatial 20Hz 双视角数据。
+- 主视角进入 Janus multimodal context 和 Cosmos 视频分支。
+- 腕部视角作为 action 分支的 image prefix。
+- 当前 robot state 开启，使用 token 编码，8 个 placeholder token。
+- latent CoT 使用 4 个未来时间点，每个未来点 1 个图像 latent + 1 个 state latent，
+  总共 8 个 latent token。
+- Cosmos 视频分支训练到 epoch 20 后冻结。
+- action 分支使用双向 action self attention。
+- bridge 位置编码使用 llama1d。

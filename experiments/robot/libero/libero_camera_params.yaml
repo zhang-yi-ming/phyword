@@ -1,0 +1,15 @@
+libero_spatial:
+  primary:
+    camera_position: [0.6586131746834771, 0.0, 1.6103500240372423]
+    camera_quaternion_wxyz:
+      - 0.6380177736282349
+      - 0.3048497438430786
+      - 0.30484986305236816
+      - 0.6380177736282349
+    fovy_deg: 45.0
+    source_image_hw: 128
+    mirror_x: true
+    point_radius: 2
+    line_width: 1
+    point_color_rgb: [220, 30, 30]
+    line_color_rgb: [220, 80, 80]
