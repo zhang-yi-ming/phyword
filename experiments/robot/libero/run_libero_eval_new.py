@@ -140,15 +140,15 @@ class GenerateConfig:
     use_proprio: bool = False                        # Whether to include proprio state in input
 
     center_crop: bool = False                        # Center crop? (if trained w/ random crop image aug)
-    num_open_loop_steps: int = 16                    # Number of actions to execute open-loop before requerying policy
-    action_repeat: int = 2                           # Number of env steps to repeat each queued action
+    num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
+    action_repeat: int = 1                           # Number of env steps to repeat each queued action
 
     unnorm_key: Union[str, Path] = "rlbench"         # Action un-normalization key
     
     # Model Architecture Overrides (Matching Training)
     video_h: int = 256
     video_w: int = 256
-    video_frames: int = 16
+    video_frames: int = 1
     num_cond_input_frames: int = 1
     action_dim: int = 7
     action_chunk: int = 16
@@ -158,10 +158,10 @@ class GenerateConfig:
     action_intermediate_size: int = 0                # If 0, infer slim MLP size from checkpoint; if >0, require an exact match
     model_variant: str = "mot2_action_spatial"      # This eval script builds the 2-MoT Cosmos + action-spatial model.
     total_latent_tokens: int = 1                     # Number of latent token CE tokens to generate at eval time
-    img_latents_per_future: int = 1
-    state_latents_per_future: int = 1
-    num_future_frames: int = 4
-    future_frame_stride: int = 0                     # Training-time interval between latent CoT future observations; if <=0, defaults to action_chunk
+    img_latents_per_future: int = 0
+    state_latents_per_future: int = 0
+    num_future_frames: int = 0
+    future_frame_stride: int = 8                     # Training-time interval between latent CoT future observations
     joint_action_prefill: bool = False               # Legacy compatibility; ignored by the 2-MoT action-spatial model
     cosmos_self_only_bridge: bool = False            # Fixed 2-MoT behavior: action can see Cosmos, Cosmos cannot see action
     decosmos: bool = False                           # Match training option: latent/action do not attend to Cosmos KV; skip Cosmos inference
@@ -169,7 +169,7 @@ class GenerateConfig:
     use_action_value_prediction: bool = False        # Fixed 2-MoT behavior: no action value token
     value_token_mask_video_to_value: bool = False     # If true, video tokens cannot attend to value tokens
     value_token_mask_nonvalue_to_value: bool = False  # If true, all non-value tokens cannot attend to value tokens
-    bridge_pos_scheme: str = "local"                 # Accepts mrope/mrope_interleave/llama1d plus legacy aliases local/last0
+    bridge_pos_scheme: str = "mrope"                 # Accepts mrope/mrope_interleave/llama1d plus legacy aliases local/last0
     action_use_latent_prefix: bool = True            # Match training option that prepends wrist image + current state to the action branch
     action_use_image_prefix: bool = False            # Legacy alias for action_use_latent_prefix
     use_history_trajectory_janus_image: bool = False  # If true, draw EE history on the Janus primary image at eval time
@@ -207,8 +207,8 @@ class GenerateConfig:
 
     cuda: str = "0"                                  # CUDA device to use
     action_denoise_steps: int = 10                     # Number of action denoising steps
-    cosmos_denoise_steps: int = 1                      # Number of Cosmos scheduler steps before KV reuse
-    fps: float = 10.0                                  # FPS for predicted Cosmos videos
+    cosmos_denoise_steps: int = 2                      # Number of Cosmos scheduler steps before KV reuse
+    fps: float = 20.0                                  # FPS for predicted Cosmos videos
     action_self_causal_in_bridge: bool = True          # Fixed 2-MoT behavior: causal action prefix, final action tokens mutually visible
 
     # fmt: on

@@ -28,7 +28,7 @@ USE_ACTION_VALUE_PREDICTION_VALUES=("false")
 ACTION_VALUE_LOSS_WEIGHT_VALUES=("1.0")
 VALUE_TOKEN_MASK_VIDEO_TO_VALUE_VALUES=("false")
 VALUE_TOKEN_MASK_NONVALUE_TO_VALUE_VALUES=("false")
-BRIDGE_POS_SCHEME_VALUES=("llama1d")
+BRIDGE_POS_SCHEME_VALUES=("mrope")
 DECOSMOS_VALUES=("false")
 COSMOS_SELF_ONLY_BRIDGE_VALUES=("false")
 REWRITE_EVAL_PROMPT_VALUES=("false")
@@ -44,6 +44,8 @@ IMG_LATENTS_PER_FUTURE_VALUES=(0)
 STATE_LATENTS_PER_FUTURE_VALUES=(0)
 NUM_FUTURE_FRAMES_VALUES=(0)
 FUTURE_FRAME_STRIDE_VALUES=(8)
+VIDEO_H_VALUES=(256)
+VIDEO_W_VALUES=(256)
 VIDEO_FRAMES_VALUES=(1)
 NUM_COND_INPUT_FRAMES_VALUES=(1)
 ACTION_CHUNK_VALUES=(16)
@@ -152,6 +154,8 @@ for array_name in \
   STATE_LATENTS_PER_FUTURE_VALUES \
   NUM_FUTURE_FRAMES_VALUES \
   FUTURE_FRAME_STRIDE_VALUES \
+  VIDEO_H_VALUES \
+  VIDEO_W_VALUES \
   VIDEO_FRAMES_VALUES \
   NUM_COND_INPUT_FRAMES_VALUES \
   ACTION_CHUNK_VALUES \
@@ -247,7 +251,7 @@ wait_for_available_slot() {
 
 validate_run_config() {
   local idx="$1"
-  local state_encoding_mode bridge_pos_scheme use_value_prediction decosmos num_trials cosmos_steps open_loop_steps video_frames num_cond_input_frames
+  local state_encoding_mode bridge_pos_scheme use_value_prediction decosmos num_trials cosmos_steps open_loop_steps video_h video_w video_frames num_cond_input_frames
 
   state_encoding_mode="$(array_value STATE_ENCODING_MODE_VALUES "$idx")"
   if [[ "$state_encoding_mode" != "token" && "$state_encoding_mode" != "mlp" ]]; then
@@ -274,11 +278,15 @@ validate_run_config() {
   num_trials="$(array_value NUM_TRIALS_PER_TASK_VALUES "$idx")"
   cosmos_steps="$(array_value COSMOS_DENOISE_STEPS_VALUES "$idx")"
   open_loop_steps="$(array_value NUM_OPEN_LOOP_STEPS_VALUES "$idx")"
+  video_h="$(array_value VIDEO_H_VALUES "$idx")"
+  video_w="$(array_value VIDEO_W_VALUES "$idx")"
   video_frames="$(array_value VIDEO_FRAMES_VALUES "$idx")"
   num_cond_input_frames="$(array_value NUM_COND_INPUT_FRAMES_VALUES "$idx")"
   require_positive_int "NUM_TRIALS_PER_TASK_VALUES[$idx]" "$num_trials"
   require_positive_int "COSMOS_DENOISE_STEPS_VALUES[$idx]" "$cosmos_steps"
   require_positive_int "NUM_OPEN_LOOP_STEPS_VALUES[$idx]" "$open_loop_steps"
+  require_positive_int "VIDEO_H_VALUES[$idx]" "$video_h"
+  require_positive_int "VIDEO_W_VALUES[$idx]" "$video_w"
   require_positive_int "VIDEO_FRAMES_VALUES[$idx]" "$video_frames"
   require_positive_int "NUM_COND_INPUT_FRAMES_VALUES[$idx]" "$num_cond_input_frames"
   if [[ "$num_cond_input_frames" -gt "$video_frames" ]]; then
@@ -308,6 +316,8 @@ print_run_config() {
   echo "[INFO] decosmos=$(array_value DECOSMOS_VALUES "$idx")"
   echo "[INFO] cosmos_denoise_steps=$(array_value COSMOS_DENOISE_STEPS_VALUES "$idx")"
   echo "[INFO] num_open_loop_steps=$(array_value NUM_OPEN_LOOP_STEPS_VALUES "$idx")"
+  echo "[INFO] video_h=$(array_value VIDEO_H_VALUES "$idx")"
+  echo "[INFO] video_w=$(array_value VIDEO_W_VALUES "$idx")"
   echo "[INFO] video_frames=$(array_value VIDEO_FRAMES_VALUES "$idx")"
   echo "[INFO] num_cond_input_frames=$(array_value NUM_COND_INPUT_FRAMES_VALUES "$idx")"
   echo "[INFO] robot_state=$(array_value ROBOT_STATE_VALUES "$idx")"
@@ -345,6 +355,8 @@ print_dry_run_env() {
   echo "  COSMOS_TEXT_CACHE_PATH=$(array_value COSMOS_TEXT_CACHE_PATH_VALUES "$idx")"
   echo "  COSMOS_DENOISE_STEPS=$(array_value COSMOS_DENOISE_STEPS_VALUES "$idx")"
   echo "  NUM_OPEN_LOOP_STEPS=$(array_value NUM_OPEN_LOOP_STEPS_VALUES "$idx")"
+  echo "  VIDEO_H=$(array_value VIDEO_H_VALUES "$idx")"
+  echo "  VIDEO_W=$(array_value VIDEO_W_VALUES "$idx")"
   echo "  VIDEO_FRAMES=$(array_value VIDEO_FRAMES_VALUES "$idx")"
   echo "  NUM_COND_INPUT_FRAMES=$(array_value NUM_COND_INPUT_FRAMES_VALUES "$idx")"
   echo "  ROBOT_STATE=$(array_value ROBOT_STATE_VALUES "$idx")"
@@ -404,6 +416,8 @@ for idx in $(seq 0 $((RUN_COUNT - 1))); do
   STATE_LATENTS_PER_FUTURE="$(array_value STATE_LATENTS_PER_FUTURE_VALUES "$idx")" \
   NUM_FUTURE_FRAMES="$(array_value NUM_FUTURE_FRAMES_VALUES "$idx")" \
   FUTURE_FRAME_STRIDE="$(array_value FUTURE_FRAME_STRIDE_VALUES "$idx")" \
+  VIDEO_H="$(array_value VIDEO_H_VALUES "$idx")" \
+  VIDEO_W="$(array_value VIDEO_W_VALUES "$idx")" \
   VIDEO_FRAMES="$(array_value VIDEO_FRAMES_VALUES "$idx")" \
   NUM_COND_INPUT_FRAMES="$(array_value NUM_COND_INPUT_FRAMES_VALUES "$idx")" \
   ACTION_CHUNK="$(array_value ACTION_CHUNK_VALUES "$idx")" \

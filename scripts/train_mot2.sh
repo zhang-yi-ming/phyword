@@ -22,7 +22,7 @@ DATA_JSON="${DATA_JSON:-/mnt/nas/zhangyiming/database/data/libero_training_data_
 ACTION_EXPERT_PATH="${ACTION_EXPERT_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
 COSMOS_PT_PATH="${COSMOS_PT_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXP_NAME="${COSMOS_EXP_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
-COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-}"
+COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_raw_full_concat}"
 
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 TRAIN_BSZ="${TRAIN_BSZ:-8}"
@@ -31,6 +31,8 @@ LR="${LR:-1e-4}"
 COSMOS_CORE_LR_RATIO="${COSMOS_CORE_LR_RATIO:-0.02}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 
+VIDEO_H="${VIDEO_H:-256}"
+VIDEO_W="${VIDEO_W:-256}"
 VIDEO_FRAMES="${VIDEO_FRAMES:-1}"
 NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-1}"
 ACTION_DIM="${ACTION_DIM:-7}"
@@ -64,7 +66,7 @@ USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS="${USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_
 SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT:-1.0}"
 WAN21_VAE_PATH="${WAN21_VAE_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/wan2.1_vae/original/Wan2.1_VAE.pth}"
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-8}"
-BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-llama1d}"
+BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
 
 echo ">>> Starting 2-MoT Libero training: ${RUN_NAME}"
 echo ">>> Spatial token mode: ${SPATIAL_TOKEN_MODE} count=${TOTAL_SPATIAL_TOKEN_COUNT}"
@@ -83,8 +85,8 @@ accelerate launch --config_file ../config/sft.yaml \
   --data_path "${DATA_JSON}" \
   --output_dir "${OUTPUT_ROOT_DIR}" \
   --log_dir "${OUTPUT_ROOT_DIR}" \
-  --video_h 256 \
-  --video_w 256 \
+  --video_h "${VIDEO_H}" \
+  --video_w "${VIDEO_W}" \
   --video_frames "${VIDEO_FRAMES}" \
   --num_cond_input_frames "${NUM_COND_INPUT_FRAMES}" \
   --fps 20 \
