@@ -5,7 +5,6 @@ REPO_ID="${1:?Usage: $0 <owner/physicalword-assets> [hf_token]}"
 HF_TOKEN_ARG="${2:-${HF_TOKEN:-}}"
 
 DATABASE_ROOT="/mnt/nas/zhangyiming/database"
-PROJECT_ROOT="/mnt/nas/zhangyiming/last05_beta/last05_mot2_action"
 
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 if [[ "${HF_USE_PROXY:-0}" == "1" ]]; then
@@ -34,29 +33,9 @@ retry() {
 }
 
 COMMON_ARGS=(--repo-type dataset)
-CREATE_ARGS=(--repo-type dataset --exist-ok)
 if [[ -n "$HF_TOKEN_ARG" ]]; then
   COMMON_ARGS+=(--token "$HF_TOKEN_ARG")
-  CREATE_ARGS+=(--token "$HF_TOKEN_ARG")
 fi
-
-hf repo create "$REPO_ID" "${CREATE_ARGS[@]}"
-
-hf upload "$REPO_ID" "$PROJECT_ROOT/HF_ASSETS_README.md" README.md \
-  "${COMMON_ARGS[@]}" \
-  --commit-message "Add asset README"
-
-hf upload "$REPO_ID" \
-  "$DATABASE_ROOT/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr" \
-  "ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr" \
-  "${COMMON_ARGS[@]}" \
-  --commit-message "Upload action expert"
-
-hf upload "$REPO_ID" \
-  "$DATABASE_ROOT/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual" \
-  "data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual" \
-  "${COMMON_ARGS[@]}" \
-  --commit-message "Upload LIBERO spatial training data"
 
 retry hf upload-large-folder "$REPO_ID" "$DATABASE_ROOT" \
   "${COMMON_ARGS[@]}" \
@@ -71,4 +50,4 @@ retry hf upload-large-folder "$REPO_ID" "$DATABASE_ROOT" \
   --num-workers "${HF_UPLOAD_WORKERS:-8}" \
   --no-bars
 
-echo "Uploaded to: https://huggingface.co/datasets/$REPO_ID"
+echo "RLBench upload resumed/completed for: https://huggingface.co/datasets/$REPO_ID"

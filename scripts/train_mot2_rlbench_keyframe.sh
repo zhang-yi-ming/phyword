@@ -16,7 +16,7 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_janus_mot2_rlbench_keyframe}"
-RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_rlbench_keyframe_spatial_v}"
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_rlbench_keyframe_spatial_v_new}"
 OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial_rlbench_keyframe}"
 
 DATA_JSON="${DATA_JSON:-/mnt/nas/zhangyiming/database/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"

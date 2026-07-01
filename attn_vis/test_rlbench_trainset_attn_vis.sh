@@ -2,21 +2,15 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05}"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
+COSMOS_ROOT="${COSMOS_ROOT:-/mnt/nas/zhangyiming/experiments}"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments_rlbench}"
-OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_cosmos_vla_3expert_rlbench_keyframe}"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial_rlbench_keyframe}"
+PYREP_PYTHON_PATH="${PYREP_PYTHON_PATH:-/mnt/nas/zhangyawen/zhangyiming/python_pkgs}"
+LIFT3D_ROOT="${LIFT3D_ROOT:-/mnt/nas/zhangyiming/requires/LIFT3D}"
+RLBENCH_ROOT="${RLBENCH_ROOT:-${LIFT3D_ROOT}/third_party/RLBench}"
 
-RUN_NAME="${RUN_NAME:-cosmos2B_janus1B_2expert_rlbench_keyframe_tokenlatent_hidden_300ep_1chunk}"
-DEFAULT_PRETRAINED_CHECKPOINT="${DEFAULT_PRETRAINED_CHECKPOINT:-/mnt/nas/zhangyiming/last05_beta/last05/exp_cosmos_vla_3expert_rlbench_keyframe/cosmos2B_janus1B_2expert_rlbench_keyframe_tokenlatent_100ep_1chunk/checkpoint-epoch-99-step-9400}"
-DATA_JSON="${DATA_JSON:-/mnt/nas/zhangyiming/database/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"
-JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B}"
-ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
-COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
-COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
-COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-}"
-OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
-
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_rlbench_keyframe_spatial_v_new}"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-}"
 RUN_DIR="${OUTPUT_ROOT_DIR}/${RUN_NAME}"
 if [[ -n "${PRETRAINED_CHECKPOINT:-}" ]]; then
@@ -24,15 +18,22 @@ if [[ -n "${PRETRAINED_CHECKPOINT:-}" ]]; then
 elif [[ -n "$CHECKPOINT_NAME" ]]; then
   PRETRAINED_CHECKPOINT="${RUN_DIR}/${CHECKPOINT_NAME}"
 else
-  PRETRAINED_CHECKPOINT="$DEFAULT_PRETRAINED_CHECKPOINT"
+  if [[ ! -d "$RUN_DIR" ]]; then
+    echo "[ERROR] Run directory does not exist: ${RUN_DIR}. Set PRETRAINED_CHECKPOINT or CHECKPOINT_NAME."
+    exit 1
+  fi
+  PRETRAINED_CHECKPOINT="$(find "$RUN_DIR" -maxdepth 1 -type d -name 'checkpoint-epoch-*-step-*' | sort -V | tail -n 1)"
+  if [[ -z "$PRETRAINED_CHECKPOINT" ]]; then
+    echo "[ERROR] No checkpoint found under ${RUN_DIR}. Set PRETRAINED_CHECKPOINT or CHECKPOINT_NAME."
+    exit 1
+  fi
 fi
-
 if [[ ! -e "$PRETRAINED_CHECKPOINT" ]]; then
   echo "[ERROR] PRETRAINED_CHECKPOINT does not exist: ${PRETRAINED_CHECKPOINT}"
   exit 1
 fi
 
-EVAL_TIMESTAMP="$(date +%Y_%m_%d-%H_%M_%S)"
+EVAL_TIMESTAMP="${EVAL_TIMESTAMP:-$(date +%Y_%m_%d-%H_%M_%S)}"
 EVAL_ARTIFACT_NAME="${EVAL_ARTIFACT_NAME:-${EVAL_TIMESTAMP}_${RUN_NAME}}"
 if [[ -n "${ATTN_VIS_DIR:-}" ]]; then
   ATTENTION_VISUALIZATION_DIR="$ATTN_VIS_DIR"
@@ -44,63 +45,96 @@ mkdir -p "$LOG_DIR" "$ATTENTION_VISUALIZATION_DIR"
 SHELL_LOG="${LOG_DIR}/test_rlbench_trainset_attn_vis_shell_${EVAL_ARTIFACT_NAME}.log"
 BASH_HPARAMS_FILE="${ATTENTION_VISUALIZATION_DIR}/test_rlbench_trainset_attn_vis_hparams_${EVAL_ARTIFACT_NAME}.env"
 
+DATA_JSON="${DATA_JSON:-/mnt/nas/zhangyiming/database/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
+COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
+COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/rlbench/train/json/cosmos_text_cache_rlbench_keyframe}"
+OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+
 ACTION_DIM="${ACTION_DIM:-7}"
 ACTION_CHUNK="${ACTION_CHUNK:-1}"
-VIDEO_FRAMES="${VIDEO_FRAMES:-5}"
-NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-1}"
-NUM_FUTURE_FRAMES="${NUM_FUTURE_FRAMES:-0}"
-IMG_LATENTS_PER_FUTURE="${IMG_LATENTS_PER_FUTURE:-0}"
-STATE_LATENTS_PER_FUTURE="${STATE_LATENTS_PER_FUTURE:-0}"
-TOTAL_LATENT_TOKENS="${TOTAL_LATENT_TOKENS:-1}"
-LATENT_TOKEN_MODE_RAW="${TOTAL_LATENT_TOKENS}"
-LATENT_TOKEN_MODE="$(printf '%s' "${LATENT_TOKEN_MODE_RAW}" | tr '[:upper:]' '[:lower:]')"
-case "${LATENT_TOKEN_MODE}" in
-  1|v)
-    LATENT_TOKEN_MODE="v"
-    TOTAL_LATENT_TOKEN_COUNT=1
-    ;;
-  n)
-    LATENT_TOKEN_MODE="n"
-    TOTAL_LATENT_TOKEN_COUNT=1
-    ;;
-  2|vn)
-    LATENT_TOKEN_MODE="vn"
-    TOTAL_LATENT_TOKEN_COUNT=2
-    ;;
-  *)
-    echo "ERROR: TOTAL_LATENT_TOKENS must be one of v, n, vn, 1, or 2; got '${LATENT_TOKEN_MODE_RAW}'." >&2
-    exit 1
-    ;;
-esac
-EXTRA_SPECIAL_TOKENS="${EXTRA_SPECIAL_TOKENS:-}"
+VIDEO_H="${VIDEO_H:-256}"
+VIDEO_W="${VIDEO_W:-256}"
+VIDEO_FRAMES="${VIDEO_FRAMES:-9}"
+NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-5}"
+IMG_LATENTS_PER_FUTURE=0
+STATE_LATENTS_PER_FUTURE=0
+NUM_FUTURE_FRAMES=0
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-1}"
 ROBOT_STATE="${ROBOT_STATE:-0}"
 STATE_PLACEHOLDER_TOKENS="${STATE_PLACEHOLDER_TOKENS:-1}"
 STATE_DIM="${STATE_DIM:-7}"
 STATE_ENCODING_MODE="${STATE_ENCODING_MODE:-mlp}"
-ACTION_INTERMEDIATE_SIZE="${ACTION_INTERMEDIATE_SIZE:-5632}"
-VIDEO_LOSS_WEIGHT="${VIDEO_LOSS_WEIGHT:-0}"
-LATENT_LOSS_WEIGHT="${LATENT_LOSS_WEIGHT:-1.0}"
-USE_LATENT_HIDDEN_SIM_LOSS="${USE_LATENT_HIDDEN_SIM_LOSS:-1}"
-LATENT_HIDDEN_SIM_LOSS_WEIGHT="${LATENT_HIDDEN_SIM_LOSS_WEIGHT:-1.0}"
-DECOSMOS="${DECOSMOS:-1}"
-TRAIN_EMBED_TOKENS="${TRAIN_EMBED_TOKENS:-1}"
-ACTION_USE_LATENT_PREFIX="${ACTION_USE_LATENT_PREFIX:-1}"
-COSMOS_SELF_ONLY_BRIDGE="${COSMOS_SELF_ONLY_BRIDGE:-1}"
-BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-llama1d}"
+BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
 ACTION_SELF_CAUSAL_IN_BRIDGE="${ACTION_SELF_CAUSAL_IN_BRIDGE:-1}"
-VIDEO_H="${VIDEO_H:-32}"
-VIDEO_W="${VIDEO_W:-32}"
-FPS="${FPS:-20}"
+ACTION_USE_LATENT_PREFIX="${ACTION_USE_LATENT_PREFIX:-1}"
+COSMOS_SELF_ONLY_BRIDGE="${COSMOS_SELF_ONLY_BRIDGE:-0}"
+DECOSMOS="${DECOSMOS:-0}"
+FPS="${FPS:-10}"
 ACTION_DENOISE_STEPS="${ACTION_DENOISE_STEPS:-10}"
 COSMOS_DENOISE_STEPS="${COSMOS_DENOISE_STEPS:-2}"
-USE_VALUE_PREDICTION="${USE_VALUE_PREDICTION:-0}"
-USE_ACTION_VALUE_PREDICTION="${USE_ACTION_VALUE_PREDICTION:-0}"
-VALUE_TOKEN_MASK_VIDEO_TO_VALUE="${VALUE_TOKEN_MASK_VIDEO_TO_VALUE:-0}"
-VALUE_TOKEN_MASK_NONVALUE_TO_VALUE="${VALUE_TOKEN_MASK_NONVALUE_TO_VALUE:-0}"
+
+SPATIAL_TOKEN_MODE_RAW="${SPATIAL_TOKEN_MODE:-${TOTAL_LATENT_TOKENS:-v}}"
+SPATIAL_TOKEN_MODE="$(printf '%s' "${SPATIAL_TOKEN_MODE_RAW}" | tr '[:upper:]' '[:lower:]')"
+case "${SPATIAL_TOKEN_MODE}" in
+  1|v)
+    SPATIAL_TOKEN_MODE="v"
+    TOTAL_SPATIAL_TOKEN_COUNT=1
+    ;;
+  n)
+    SPATIAL_TOKEN_MODE="n"
+    TOTAL_SPATIAL_TOKEN_COUNT=1
+    ;;
+  2|vn)
+    SPATIAL_TOKEN_MODE="vn"
+    TOTAL_SPATIAL_TOKEN_COUNT=2
+    ;;
+  *)
+    echo "ERROR: SPATIAL_TOKEN_MODE must be one of v, n, vn, 1, or 2; got '${SPATIAL_TOKEN_MODE_RAW}'." >&2
+    exit 1
+    ;;
+esac
+
+DEFAULT_EXTRA_SPECIAL_TOKENS="</PAD>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
+EXTRA_SPECIAL_TOKENS="${EXTRA_SPECIAL_TOKENS:-${DEFAULT_EXTRA_SPECIAL_TOKENS}}"
+USE_SPATIAL_HIDDEN_SIM_LOSS="${USE_SPATIAL_HIDDEN_SIM_LOSS:-1}"
+SPATIAL_HIDDEN_SIM_LOSS_MODE="${SPATIAL_HIDDEN_SIM_LOSS_MODE:-siglip}"
+SPATIAL_HIDDEN_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT:-1.0}"
+USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS="${USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS:-0}"
+SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT:-1.0}"
+WAN21_VAE_PATH="${WAN21_VAE_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/wan2.1_vae/original/Wan2.1_VAE.pth}"
+
+DEFAULT_TASK_NAMES="close_box,close_laptop_lid,sweep_to_dustpan,phone_on_base,toilet_seat_down,close_fridge,place_wine_at_rack_location,water_plants,take_umbrella_out_of_umbrella_stand,take_frame_off_hanger"
+TASK_IDS="${TASK_IDS:-}"
+if [[ -n "${TASK_NAMES:-}" ]]; then
+  TASK_NAMES="${TASK_NAMES}"
+elif [[ -n "$TASK_IDS" ]]; then
+  IFS=',' read -r -a DEFAULT_TASK_ARRAY <<< "$DEFAULT_TASK_NAMES"
+  TASK_NAMES=""
+  IFS=',' read -r -a TASK_ID_ARRAY <<< "$TASK_IDS"
+  for raw_task_id in "${TASK_ID_ARRAY[@]}"; do
+    task_id="${raw_task_id//[[:space:]]/}"
+    if [[ ! "$task_id" =~ ^[0-9]+$ ]]; then
+      echo "[ERROR] Invalid TASK_IDS entry: ${raw_task_id}. Use comma-separated integers in [0, 9]."
+      exit 1
+    fi
+    if (( task_id < 0 || task_id >= ${#DEFAULT_TASK_ARRAY[@]} )); then
+      echo "[ERROR] TASK_IDS entry out of range: ${task_id}. Valid range is 0-9."
+      exit 1
+    fi
+    if [[ -n "$TASK_NAMES" ]]; then
+      TASK_NAMES+=","
+    fi
+    TASK_NAMES+="${DEFAULT_TASK_ARRAY[$task_id]}"
+  done
+else
+  TASK_NAMES=""
+fi
 
 NUM_TRAJECTORIES_PER_TASK="${NUM_TRAJECTORIES_PER_TASK:-1}"
-TASK_NAMES="${TASK_NAMES:-}"
 MAX_RECORDS_PER_EPISODE="${MAX_RECORDS_PER_EPISODE:-0}"
 MAX_TOTAL_RECORDS="${MAX_TOTAL_RECORDS:-0}"
 ATTN_VIS_TILE_SIZE="${ATTN_VIS_TILE_SIZE:-256}"
@@ -123,18 +157,20 @@ write_hparam() {
 
 {
   for key in \
-    SCRIPT_DIR LAST05_ROOT EXPERIMENTS_ROOT OUTPUT_ROOT_DIR RUN_NAME RUN_DIR CHECKPOINT_NAME DEFAULT_PRETRAINED_CHECKPOINT PRETRAINED_CHECKPOINT \
+    SCRIPT_DIR LAST05_ROOT COSMOS_ROOT EXPERIMENTS_ROOT OUTPUT_ROOT_DIR RUN_NAME RUN_DIR CHECKPOINT_NAME PRETRAINED_CHECKPOINT \
     EVAL_TIMESTAMP EVAL_ARTIFACT_NAME ATTENTION_VISUALIZATION_DIR LOG_DIR SHELL_LOG BASH_HPARAMS_FILE \
     OMP_NUM_THREADS HF_HUB_OFFLINE \
     DATA_JSON JANUS_MODEL_PATH ACTION_MODEL_PATH COSMOS_MODEL_PATH COSMOS_EXPERIMENT_NAME COSMOS_TEXT_CACHE_PATH \
-    ACTION_DIM ACTION_CHUNK VIDEO_FRAMES NUM_COND_INPUT_FRAMES NUM_FUTURE_FRAMES IMG_LATENTS_PER_FUTURE STATE_LATENTS_PER_FUTURE TOTAL_LATENT_TOKENS LATENT_TOKEN_MODE_RAW LATENT_TOKEN_MODE TOTAL_LATENT_TOKEN_COUNT EXTRA_SPECIAL_TOKENS FUTURE_FRAME_STRIDE \
-    ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_DIM STATE_ENCODING_MODE ACTION_INTERMEDIATE_SIZE \
-    VIDEO_LOSS_WEIGHT LATENT_LOSS_WEIGHT USE_LATENT_HIDDEN_SIM_LOSS LATENT_HIDDEN_SIM_LOSS_WEIGHT \
-    DECOSMOS TRAIN_EMBED_TOKENS ACTION_USE_LATENT_PREFIX COSMOS_SELF_ONLY_BRIDGE BRIDGE_POS_SCHEME ACTION_SELF_CAUSAL_IN_BRIDGE \
-    VIDEO_H VIDEO_W FPS ACTION_DENOISE_STEPS COSMOS_DENOISE_STEPS USE_VALUE_PREDICTION USE_ACTION_VALUE_PREDICTION \
-    VALUE_TOKEN_MASK_VIDEO_TO_VALUE VALUE_TOKEN_MASK_NONVALUE_TO_VALUE \
-    NUM_TRAJECTORIES_PER_TASK TASK_NAMES MAX_RECORDS_PER_EPISODE MAX_TOTAL_RECORDS \
-    ATTN_VIS_TILE_SIZE ATTN_VIS_ALPHA ATTN_VIS_CAPTURE_MODE ATTN_VIS_TOP_RATIO ATTN_VIS_TOP_SOFTNESS CUDA_DEVICE SEED EMPTY_CACHE_EVERY
+    ACTION_DIM ACTION_CHUNK VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES IMG_LATENTS_PER_FUTURE STATE_LATENTS_PER_FUTURE NUM_FUTURE_FRAMES FUTURE_FRAME_STRIDE \
+    ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_DIM STATE_ENCODING_MODE \
+    BRIDGE_POS_SCHEME ACTION_SELF_CAUSAL_IN_BRIDGE ACTION_USE_LATENT_PREFIX COSMOS_SELF_ONLY_BRIDGE DECOSMOS \
+    FPS ACTION_DENOISE_STEPS COSMOS_DENOISE_STEPS \
+    SPATIAL_TOKEN_MODE_RAW SPATIAL_TOKEN_MODE TOTAL_SPATIAL_TOKEN_COUNT EXTRA_SPECIAL_TOKENS \
+    USE_SPATIAL_HIDDEN_SIM_LOSS SPATIAL_HIDDEN_SIM_LOSS_MODE SPATIAL_HIDDEN_SIM_LOSS_WEIGHT \
+    USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT WAN21_VAE_PATH \
+    DEFAULT_TASK_NAMES TASK_IDS TASK_NAMES NUM_TRAJECTORIES_PER_TASK MAX_RECORDS_PER_EPISODE MAX_TOTAL_RECORDS \
+    ATTN_VIS_TILE_SIZE ATTN_VIS_ALPHA ATTN_VIS_CAPTURE_MODE ATTN_VIS_TOP_RATIO ATTN_VIS_TOP_SOFTNESS CUDA_DEVICE SEED EMPTY_CACHE_EVERY \
+    PYREP_PYTHON_PATH LIFT3D_ROOT RLBENCH_ROOT
   do
     write_hparam "$key"
   done
@@ -143,7 +179,7 @@ write_hparam() {
 cd "$LAST05_ROOT"
 source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
 export PATH=/root/miniconda3/envs/last05/bin:$PATH
-export PYTHONPATH="${LAST05_ROOT}:${PYTHONPATH:-}"
+export PYTHONPATH="${PYREP_PYTHON_PATH}:${LIFT3D_ROOT}:${RLBENCH_ROOT}:${COSMOS_ROOT}:${LAST05_ROOT}:${PYTHONPATH:-}"
 export OMP_NUM_THREADS
 export HF_HUB_OFFLINE
 export WANDB_MODE=offline
@@ -155,16 +191,16 @@ echo "[INFO] bash hparams file: $BASH_HPARAMS_FILE"
 echo "[INFO] eval artifact name: $EVAL_ARTIFACT_NAME"
 echo "[INFO] attention visualization dir: $ATTENTION_VISUALIZATION_DIR"
 echo "[INFO] checkpoint: $PRETRAINED_CHECKPOINT"
-echo "[INFO] latent token mode: ${LATENT_TOKEN_MODE} (count=${TOTAL_LATENT_TOKEN_COUNT}, input=${LATENT_TOKEN_MODE_RAW})"
+echo "[INFO] spatial token mode: ${SPATIAL_TOKEN_MODE} (count=${TOTAL_SPATIAL_TOKEN_COUNT}, input=${SPATIAL_TOKEN_MODE_RAW})"
 echo "[INFO] working dir: $(pwd)"
 echo "[INFO] python: $(which python)"
 echo "[INFO] bash hparams begin"
-sed -n '1,220p' "$BASH_HPARAMS_FILE"
+sed -n '1,240p' "$BASH_HPARAMS_FILE"
 echo "[INFO] bash hparams end"
 python -V
 python -c "import sys; print('[INFO] sys.executable:', sys.executable)"
 
-python -u "${SCRIPT_DIR}/run_rlbench_trainset_attn_vis.py" \
+python -u "${SCRIPT_DIR}/run_rlbench_trainset_attn_vis_mot2_action.py" \
   --pretrained_checkpoint "$PRETRAINED_CHECKPOINT" \
   --model_path "$JANUS_MODEL_PATH" \
   --action_model_path "$ACTION_MODEL_PATH" \
@@ -196,25 +232,21 @@ python -u "${SCRIPT_DIR}/run_rlbench_trainset_attn_vis.py" \
   --state_placeholder_tokens "$STATE_PLACEHOLDER_TOKENS" \
   --state_dim "$STATE_DIM" \
   --state_encoding_mode "$STATE_ENCODING_MODE" \
-  --action_intermediate_size "$ACTION_INTERMEDIATE_SIZE" \
-  --total_latent_tokens "$TOTAL_LATENT_TOKEN_COUNT" \
-  --latent_token_mode "$LATENT_TOKEN_MODE" \
+  --total_latent_tokens "$TOTAL_SPATIAL_TOKEN_COUNT" \
+  --latent_token_mode "$SPATIAL_TOKEN_MODE" \
   --extra_special_tokens "$EXTRA_SPECIAL_TOKENS" \
   --img_latents_per_future "$IMG_LATENTS_PER_FUTURE" \
   --state_latents_per_future "$STATE_LATENTS_PER_FUTURE" \
   --num_future_frames "$NUM_FUTURE_FRAMES" \
   --future_frame_stride "$FUTURE_FRAME_STRIDE" \
-  --video_loss_weight "$VIDEO_LOSS_WEIGHT" \
-  --latent_loss_weight "$LATENT_LOSS_WEIGHT" \
-  --use_latent_hidden_sim_loss "$USE_LATENT_HIDDEN_SIM_LOSS" \
-  --latent_hidden_sim_loss_weight "$LATENT_HIDDEN_SIM_LOSS_WEIGHT" \
+  --use_latent_hidden_sim_loss "$USE_SPATIAL_HIDDEN_SIM_LOSS" \
+  --latent_hidden_sim_loss_mode "$SPATIAL_HIDDEN_SIM_LOSS_MODE" \
+  --latent_hidden_sim_loss_weight "$SPATIAL_HIDDEN_SIM_LOSS_WEIGHT" \
+  --use_latent_hidden_wan_downsample_sim_loss "$USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS" \
+  --latent_hidden_wan_downsample_sim_loss_weight "$SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT" \
+  --wan21_vae_path "$WAN21_VAE_PATH" \
   --cosmos_self_only_bridge "$COSMOS_SELF_ONLY_BRIDGE" \
-  --train_embed_tokens "$TRAIN_EMBED_TOKENS" \
   --decosmos "$DECOSMOS" \
-  --use_value_prediction "$USE_VALUE_PREDICTION" \
-  --use_action_value_prediction "$USE_ACTION_VALUE_PREDICTION" \
-  --value_token_mask_video_to_value "$VALUE_TOKEN_MASK_VIDEO_TO_VALUE" \
-  --value_token_mask_nonvalue_to_value "$VALUE_TOKEN_MASK_NONVALUE_TO_VALUE" \
   --bridge_pos_scheme "$BRIDGE_POS_SCHEME" \
   --action_use_latent_prefix "$ACTION_USE_LATENT_PREFIX" \
   --action_self_causal_in_bridge "$ACTION_SELF_CAUSAL_IN_BRIDGE" \
