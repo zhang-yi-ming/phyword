@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
+EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments_rlbench}"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial_rlbench_keyframe}"
+PYREP_PYTHON_PATH="${PYREP_PYTHON_PATH:-/mnt/nas/zhangyawen/zhangyiming/python_pkgs}"
+LIFT3D_ROOT="${LIFT3D_ROOT:-/mnt/nas/zhangyiming/requires/LIFT3D}"
+RLBENCH_ROOT="${RLBENCH_ROOT:-${LIFT3D_ROOT}/third_party/RLBench}"
+
+LOG_DIR="${EXPERIMENTS_ROOT}/shell"
+mkdir -p "$LOG_DIR"
+EVAL_TIMESTAMP="$(date +%Y_%m_%d-%H_%M_%S)"
+SHELL_LOG="$LOG_DIR/test_rlbench_keyframe_shell_${EVAL_TIMESTAMP}.log"
+
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_rlbench_keyframe_spatial_n}"
+CHECKPOINT_NAME="${CHECKPOINT_NAME:-}"
+RUN_DIR="${OUTPUT_ROOT_DIR}/${RUN_NAME}"
+if [[ -n "${PRETRAINED_CHECKPOINT:-}" ]]; then
+  PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT}"
+elif [[ -n "$CHECKPOINT_NAME" ]]; then
+  PRETRAINED_CHECKPOINT="${RUN_DIR}/${CHECKPOINT_NAME}"
+else
+  if [[ ! -d "$RUN_DIR" ]]; then
+    echo "[ERROR] Run directory does not exist: ${RUN_DIR}. Set PRETRAINED_CHECKPOINT or CHECKPOINT_NAME."
+    exit 1
+  fi
+  PRETRAINED_CHECKPOINT="$(find "$RUN_DIR" -maxdepth 1 -type d -name 'checkpoint-epoch-*-step-*' | sort -V | tail -n 1)"
+  if [[ -z "$PRETRAINED_CHECKPOINT" ]]; then
+    echo "[ERROR] No checkpoint found under ${RUN_DIR}. Set PRETRAINED_CHECKPOINT or CHECKPOINT_NAME."
+    exit 1
+  fi
+fi
+
+EVAL_ARTIFACT_NAME="${EVAL_ARTIFACT_NAME:-${EVAL_TIMESTAMP}_${RUN_NAME}}"
+RESULT_DIR="${RESULT_DIR:-${EXPERIMENTS_ROOT}/rlbench_eval/${EVAL_ARTIFACT_NAME}}"
+BASH_HPARAMS_FILE="${LOG_DIR}/test_rlbench_keyframe_hparams_${EVAL_ARTIFACT_NAME}.env"
+
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+ACTION_BACKBONE_TYPE="${ACTION_BACKBONE_TYPE:-auto}"
+QWEN3VL_MODEL_PATH="${QWEN3VL_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Qwen3-VL-2B-Instruct}"
+COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
+COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
+COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-}"
+TRAIN_PROMPT_JSON_PATH="${TRAIN_PROMPT_JSON_PATH:-/mnt/nas/zhangyiming/database/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"
+
+DEFAULT_TASK_NAMES="close_box,close_laptop_lid,sweep_to_dustpan,phone_on_base,toilet_seat_down,close_fridge,place_wine_at_rack_location,water_plants,take_umbrella_out_of_umbrella_stand,take_frame_off_hanger"
+TASK_IDS="${TASK_IDS:-0}"
+if [[ -n "${TASK_NAMES:-}" ]]; then
+  TASK_NAMES="${TASK_NAMES}"
+elif [[ -n "$TASK_IDS" ]]; then
+  IFS=',' read -r -a DEFAULT_TASK_ARRAY <<< "$DEFAULT_TASK_NAMES"
+  TASK_NAMES=""
+  IFS=',' read -r -a TASK_ID_ARRAY <<< "$TASK_IDS"
+  for raw_task_id in "${TASK_ID_ARRAY[@]}"; do
+    task_id="${raw_task_id//[[:space:]]/}"
+    if [[ ! "$task_id" =~ ^[0-9]+$ ]]; then
+      echo "[ERROR] Invalid TASK_IDS entry: ${raw_task_id}. Use comma-separated integers in [0, 9]."
+      exit 1
+    fi
+    if (( task_id < 0 || task_id >= ${#DEFAULT_TASK_ARRAY[@]} )); then
+      echo "[ERROR] TASK_IDS entry out of range: ${task_id}. Valid range is 0-9."
+      exit 1
+    fi
+    if [[ -n "$TASK_NAMES" ]]; then
+      TASK_NAMES+=","
+    fi
+    TASK_NAMES+="${DEFAULT_TASK_ARRAY[$task_id]}"
+  done
+else
+  TASK_NAMES="$DEFAULT_TASK_NAMES"
+fi
+NUM_EPISODES="${NUM_EPISODES:-1}"
+CUDA_DEVICE="${CUDA_DEVICE:-0}"
+SEED="${SEED:-0}"
+
+ACTION_DIM=7
+ACTION_CHUNK=1
+VIDEO_H="${VIDEO_H:-256}"
+VIDEO_W="${VIDEO_W:-256}"
+VIDEO_FRAMES=5
+NUM_COND_INPUT_FRAMES=1
+ENV_IMG_RES="${ENV_IMG_RES:-224}"
+TOTAL_LATENT_TOKENS="${TOTAL_LATENT_TOKENS:-1}"
+IMG_LATENTS_PER_FUTURE=0
+STATE_LATENTS_PER_FUTURE=0
+NUM_FUTURE_FRAMES=0
+FUTURE_FRAME_STRIDE=1
+ROBOT_STATE=0
+STATE_PLACEHOLDER_TOKENS=1
+STATE_DIM=7
+STATE_ENCODING_MODE="mlp"
+BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
+ACTION_DENOISE_STEPS="${ACTION_DENOISE_STEPS:-10}"
+COSMOS_DENOISE_STEPS="${COSMOS_DENOISE_STEPS:-2}"
+FPS="${FPS:-10}"
+NUM_OPEN_LOOP_STEPS="${NUM_OPEN_LOOP_STEPS:-1}"
+ACTION_REPEAT="${ACTION_REPEAT:-1}"
+MAX_KEYFRAME_CHUNKS="${MAX_KEYFRAME_CHUNKS:-10}"
+MAX_STEPS="${MAX_STEPS:-$((MAX_KEYFRAME_CHUNKS * ACTION_CHUNK * ACTION_REPEAT))}"
+RESET_RETRIES="${RESET_RETRIES:-10}"
+RESET_RETRY_DELAY_SECONDS="${RESET_RETRY_DELAY_SECONDS:-1.0}"
+SAVE_KEYFRAME_VIDEO="${SAVE_KEYFRAME_VIDEO:-false}"
+SAVE_ROLLOUT_IMAGES="${SAVE_ROLLOUT_IMAGES:-false}"
+SAVE_COSMOS_VIDEOS="${SAVE_COSMOS_VIDEOS:-false}"
+
+COPPELIASIM_ROOT="${COPPELIASIM_ROOT:-/mnt/nas/chenhao/CoppeliaSim}"
+QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-}"
+RLBENCH_LD_PRELOAD="${RLBENCH_LD_PRELOAD:-/lib/x86_64-linux-gnu/libxcb.so.1}"
+XVFB_DISPLAY="${XVFB_DISPLAY:-auto}"
+PORTABLE_XVFB_ROOT="${PORTABLE_XVFB_ROOT:-/mnt/nas/zhangyiming/train/bash/portable_xvfb}"
+XVFB_BIN="${XVFB_BIN:-Xvfb}"
+XVFB_ARGS="${XVFB_ARGS:-}"
+XVFB_LD_LIBRARY_PATH="${XVFB_LD_LIBRARY_PATH:-}"
+XVFB_PID=""
+
+if [[ "$QT_QPA_PLATFORM" == "offscreen" ]]; then
+  XVFB_DISPLAY="none"
+fi
+
+if ! command -v "$XVFB_BIN" >/dev/null 2>&1 && [[ -x "${PORTABLE_XVFB_ROOT}/bin/Xvfb" ]]; then
+  XVFB_BIN="${PORTABLE_XVFB_ROOT}/bin/Xvfb"
+  if [[ -z "$XVFB_ARGS" && -d "${PORTABLE_XVFB_ROOT}/share/X11/xkb" ]]; then
+    XVFB_ARGS="-xkbdir ${PORTABLE_XVFB_ROOT}/share/X11/xkb"
+  fi
+  if [[ -z "$XVFB_LD_LIBRARY_PATH" && -d "${PORTABLE_XVFB_ROOT}/lib" ]]; then
+    XVFB_LD_LIBRARY_PATH="${PORTABLE_XVFB_ROOT}/lib"
+    if [[ -d "/tmp/a3-libgl-shim" ]]; then
+      XVFB_LD_LIBRARY_PATH="/tmp/a3-libgl-shim:${XVFB_LD_LIBRARY_PATH}"
+    fi
+  fi
+fi
+if [[ "$XVFB_BIN" == "${PORTABLE_XVFB_ROOT}/bin/Xvfb" && -x "${PORTABLE_XVFB_ROOT}/bin/xkbcomp" ]]; then
+  mkdir -p /tmp/xkb
+  ln -sf "${PORTABLE_XVFB_ROOT}/bin/xkbcomp" /tmp/xkb/xkbcomp
+fi
+
+exec > >(tee -a "$SHELL_LOG") 2>&1
+set -x
+trap 'rc=$?; echo "[ERROR] test_rlbench_keyframe_2expert.sh failed with exit code ${rc}"' ERR
+
+{
+  for key in LAST05_ROOT EXPERIMENTS_ROOT OUTPUT_ROOT_DIR RUN_NAME RUN_DIR CHECKPOINT_NAME PRETRAINED_CHECKPOINT \
+    EVAL_ARTIFACT_NAME RESULT_DIR JANUS_MODEL_PATH ACTION_MODEL_PATH ACTION_BACKBONE_TYPE QWEN3VL_MODEL_PATH COSMOS_MODEL_PATH COSMOS_EXPERIMENT_NAME COSMOS_TEXT_CACHE_PATH \
+    TRAIN_PROMPT_JSON_PATH DEFAULT_TASK_NAMES TASK_IDS TASK_NAMES NUM_EPISODES MAX_KEYFRAME_CHUNKS MAX_STEPS CUDA_DEVICE SEED ACTION_DIM ACTION_CHUNK VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES ENV_IMG_RES \
+    TOTAL_LATENT_TOKENS IMG_LATENTS_PER_FUTURE STATE_LATENTS_PER_FUTURE NUM_FUTURE_FRAMES FUTURE_FRAME_STRIDE \
+    ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_DIM STATE_ENCODING_MODE \
+    BRIDGE_POS_SCHEME ACTION_DENOISE_STEPS COSMOS_DENOISE_STEPS \
+    FPS NUM_OPEN_LOOP_STEPS ACTION_REPEAT RESET_RETRIES RESET_RETRY_DELAY_SECONDS SAVE_KEYFRAME_VIDEO SAVE_ROLLOUT_IMAGES SAVE_COSMOS_VIDEOS \
+    PYREP_PYTHON_PATH LIFT3D_ROOT RLBENCH_ROOT COPPELIASIM_ROOT QT_QPA_PLATFORM RLBENCH_LD_PRELOAD \
+    XVFB_DISPLAY PORTABLE_XVFB_ROOT XVFB_BIN XVFB_ARGS XVFB_LD_LIBRARY_PATH
+  do
+    printf '%s=%s\n' "$key" "${!key}"
+  done
+} > "$BASH_HPARAMS_FILE"
+
+cd "$LAST05_ROOT"
+source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
+export PATH=/root/miniconda3/envs/last05/bin:$PATH
+export PYTHONPATH="${PYREP_PYTHON_PATH}:${LIFT3D_ROOT}:${RLBENCH_ROOT}:${LAST05_ROOT}:${PYTHONPATH:-}"
+export WANDB_MODE=offline
+export TOKENIZERS_PARALLELISM=false
+ORIGINAL_LD_PRELOAD="${LD_PRELOAD:-}"
+if [[ -n "$RLBENCH_LD_PRELOAD" ]]; then
+  if [[ -e "$RLBENCH_LD_PRELOAD" ]]; then
+    if [[ -n "$ORIGINAL_LD_PRELOAD" ]]; then
+      export LD_PRELOAD="${RLBENCH_LD_PRELOAD}:${ORIGINAL_LD_PRELOAD}"
+    else
+      export LD_PRELOAD="$RLBENCH_LD_PRELOAD"
+    fi
+  else
+    echo "[WARN] RLBENCH_LD_PRELOAD does not exist: ${RLBENCH_LD_PRELOAD}; continuing without LD_PRELOAD override."
+    if [[ -n "$ORIGINAL_LD_PRELOAD" ]]; then
+      export LD_PRELOAD="$ORIGINAL_LD_PRELOAD"
+    else
+      unset LD_PRELOAD
+    fi
+  fi
+elif [[ -n "$ORIGINAL_LD_PRELOAD" ]]; then
+  export LD_PRELOAD="$ORIGINAL_LD_PRELOAD"
+else
+  unset LD_PRELOAD
+fi
+export COPPELIASIM_ROOT
+if [[ -n "$QT_QPA_PLATFORM" ]]; then
+  export QT_QPA_PLATFORM
+fi
+CONDA_ENV_LIB="/root/miniconda3/envs/last05/lib"
+PYTHON_EXTRA_LD_LIBRARY_PATH=""
+if [[ -d "$CONDA_ENV_LIB" ]]; then
+  PYTHON_EXTRA_LD_LIBRARY_PATH="${PYTHON_EXTRA_LD_LIBRARY_PATH}:$CONDA_ENV_LIB"
+fi
+if [[ -d "${PORTABLE_XVFB_ROOT}/lib" ]]; then
+  PYTHON_EXTRA_LD_LIBRARY_PATH="${PYTHON_EXTRA_LD_LIBRARY_PATH}:${PORTABLE_XVFB_ROOT}/lib"
+fi
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$COPPELIASIM_ROOT:$COPPELIASIM_ROOT/platforms${PYTHON_EXTRA_LD_LIBRARY_PATH}"
+export QT_QPA_PLATFORM_PLUGIN_PATH="$COPPELIASIM_ROOT"
+XVFB_AUTO_LOCK_FD=""
+release_xvfb_auto_lock() {
+  if [[ -n "${XVFB_AUTO_LOCK_FD:-}" ]]; then
+    eval "exec ${XVFB_AUTO_LOCK_FD}>&-" || true
+    XVFB_AUTO_LOCK_FD=""
+  fi
+}
+if [[ "$XVFB_DISPLAY" == "auto" ]]; then
+  XVFB_DISPLAY=""
+  if [[ -z "${DISPLAY:-}" ]]; then
+    XVFB_LOCK_DIR="${TMPDIR:-/tmp}/rlbench_xvfb_display_locks"
+    mkdir -p "$XVFB_LOCK_DIR"
+    for display_num in 99 98 97 96 95 94 93 92 91 90; do
+      if [[ ! -e "/tmp/.X${display_num}-lock" && ! -S "/tmp/.X11-unix/X${display_num}" ]]; then
+        exec {candidate_lock_fd}>"${XVFB_LOCK_DIR}/X${display_num}.lock"
+        if ! flock -n "${candidate_lock_fd}"; then
+          eval "exec ${candidate_lock_fd}>&-" || true
+          continue
+        fi
+        XVFB_AUTO_LOCK_FD="${candidate_lock_fd}"
+        XVFB_DISPLAY=":${display_num}"
+        break
+      fi
+    done
+  fi
+fi
+if [[ -n "$XVFB_DISPLAY" && "$XVFB_DISPLAY" != "none" ]]; then
+  if command -v "$XVFB_BIN" >/dev/null 2>&1; then
+    if [[ -n "$XVFB_LD_LIBRARY_PATH" ]]; then
+      env LD_LIBRARY_PATH="${XVFB_LD_LIBRARY_PATH}:${LD_LIBRARY_PATH:-}" "$XVFB_BIN" "$XVFB_DISPLAY" -screen 0 1024x768x24 ${XVFB_ARGS} &
+    else
+      "$XVFB_BIN" "$XVFB_DISPLAY" -screen 0 1024x768x24 ${XVFB_ARGS} &
+    fi
+    XVFB_PID="$!"
+    sleep 2
+    if ! kill -0 "$XVFB_PID" >/dev/null 2>&1; then
+      release_xvfb_auto_lock
+      echo "[ERROR] Xvfb failed to stay running on ${XVFB_DISPLAY}."
+      exit 1
+    fi
+    release_xvfb_auto_lock
+    export DISPLAY="$XVFB_DISPLAY"
+    trap 'rc=$?; if [[ -n "${XVFB_PID:-}" ]]; then kill "${XVFB_PID}" >/dev/null 2>&1 || true; fi; echo "[ERROR] test_rlbench_keyframe_2expert.sh failed with exit code ${rc}"' ERR
+    trap 'if [[ -n "${XVFB_PID:-}" ]]; then kill "${XVFB_PID}" >/dev/null 2>&1 || true; fi' EXIT
+  else
+    echo "[ERROR] XVFB_DISPLAY=${XVFB_DISPLAY} requested but Xvfb is not available."
+    exit 1
+  fi
+fi
+
+python -u "$LAST05_ROOT/experiments/robot/rlbench/run_rlbench_eval_keyframe_mot2.py" \
+  --pretrained_checkpoint "$PRETRAINED_CHECKPOINT" \
+  --model_path "$JANUS_MODEL_PATH" \
+  --action_model_path "$ACTION_MODEL_PATH" \
+  --action_backbone_type "$ACTION_BACKBONE_TYPE" \
+  --qwen3vl_model_path "$QWEN3VL_MODEL_PATH" \
+  --cosmos_model_path "$COSMOS_MODEL_PATH" \
+  --cosmos_experiment_name "$COSMOS_EXPERIMENT_NAME" \
+  --cosmos_text_cache_path "$COSMOS_TEXT_CACHE_PATH" \
+  --train_prompt_json_path "$TRAIN_PROMPT_JSON_PATH" \
+  --task_names "$TASK_NAMES" \
+  --num_episodes "$NUM_EPISODES" \
+  --max_steps "$MAX_STEPS" \
+  --result_dir "$RESULT_DIR" \
+  --bash_hparams_path "$BASH_HPARAMS_FILE" \
+  --eval_artifact_name "$EVAL_ARTIFACT_NAME" \
+  --cuda "$CUDA_DEVICE" \
+  --seed "$SEED" \
+  --action_dim "$ACTION_DIM" \
+  --action_chunk "$ACTION_CHUNK" \
+  --video_frames "$VIDEO_FRAMES" \
+  --num_cond_input_frames "$NUM_COND_INPUT_FRAMES" \
+  --env_img_res "$ENV_IMG_RES" \
+  --total_latent_tokens "$TOTAL_LATENT_TOKENS" \
+  --img_latents_per_future "$IMG_LATENTS_PER_FUTURE" \
+  --state_latents_per_future "$STATE_LATENTS_PER_FUTURE" \
+  --num_future_frames "$NUM_FUTURE_FRAMES" \
+  --future_frame_stride "$FUTURE_FRAME_STRIDE" \
+  --robot_state "$ROBOT_STATE" \
+  --state_placeholder_tokens "$STATE_PLACEHOLDER_TOKENS" \
+  --state_dim "$STATE_DIM" \
+  --state_encoding_mode "$STATE_ENCODING_MODE" \
+  --bridge_pos_scheme "$BRIDGE_POS_SCHEME" \
+  --action_denoise_steps "$ACTION_DENOISE_STEPS" \
+  --cosmos_denoise_steps "$COSMOS_DENOISE_STEPS" \
+  --fps "$FPS" \
+  --num_open_loop_steps "$NUM_OPEN_LOOP_STEPS" \
+  --action_repeat "$ACTION_REPEAT" \
+  --reset_retries "$RESET_RETRIES" \
+  --reset_retry_delay_seconds "$RESET_RETRY_DELAY_SECONDS" \
+  --save_keyframe_video "$SAVE_KEYFRAME_VIDEO" \
+  --save_rollout_images "$SAVE_ROLLOUT_IMAGES" \
+  --save_cosmos_videos "$SAVE_COSMOS_VIDEOS" \
+  --video_h "$VIDEO_H" \
+  --video_w "$VIDEO_W"
