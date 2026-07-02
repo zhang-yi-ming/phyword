@@ -421,7 +421,7 @@ def model_load(cfg: EvalConfig):
         config_file="cosmos_predict2/_src/predict2/configs/video2world/config.py",
         load_ema_to_reg=True,
         to_device="cpu",
-        experiment_opts=["data_train=mock", "data_val=mock"],
+        experiment_opts=["data_train=mock", "data_val=mock", "model.config.net.sac_config.mode=none"],
     )
     resolve_video_condition_config(cfg, cosmos_wrapper.tokenizer)
 

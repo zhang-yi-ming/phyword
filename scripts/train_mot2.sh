@@ -1,14 +1,41 @@
 #!/bin/bash
 set -e
 
-LAST05_ROOT="/mnt/nas/zhangyiming/last05_beta/last05_mot2_trex_action"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAST05_ROOT="${LAST05_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+LAST05_BETA_ROOT="${LAST05_BETA_ROOT:-$(cd "${LAST05_ROOT}/.." && pwd)}"
+
+for _last05_env in "${LAST05_LOCAL_ENV:-}" "${LAST05_BETA_ROOT}/last05_local_env.sh" "${LAST05_ROOT}/last05_local_env.sh"; do
+  if [[ -n "${_last05_env}" && -f "${_last05_env}" ]]; then
+    # shellcheck disable=SC1090
+    source "${_last05_env}"
+    break
+  fi
+done
+
+DATABASE_ROOT="${DATABASE_ROOT:-/mnt/nas/zhangyiming/database}"
+PRETRAINED_ROOT="${PRETRAINED_ROOT:-${DATABASE_ROOT}/ckpt/pretrained}"
+REQUIRES_ROOT="${REQUIRES_ROOT:-/mnt/nas/zhangyiming/requires}"
+CONDA_BASE="${CONDA_BASE:-/root/miniconda3}"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-last05}"
+CONDA_ENV_PATH="${CONDA_ENV_PATH:-${CONDA_BASE}/envs/${CONDA_ENV_NAME}}"
+EXPERIMENTS_LIBERO_ROOT="${EXPERIMENTS_LIBERO_ROOT:-${LAST05_BETA_ROOT}/experiments}"
+EXPERIMENTS_RLBENCH_ROOT="${EXPERIMENTS_RLBENCH_ROOT:-${LAST05_BETA_ROOT}/experiments_rlbench}"
+COSMOS_ROOT="${COSMOS_ROOT:-/mnt/nas/zhangyiming/experiments}"
+LIBERO_ROOT="${LIBERO_ROOT:-/mnt/nas/zhangxuheng/LIBERO}"
+PYREP_PYTHON_PATH="${PYREP_PYTHON_PATH:-/mnt/nas/zhangyawen/zhangyiming/python_pkgs}"
+LIFT3D_ROOT="${LIFT3D_ROOT:-${REQUIRES_ROOT}/LIFT3D}"
+RLBENCH_ROOT="${RLBENCH_ROOT:-${LIFT3D_ROOT}/third_party/RLBench}"
 
 cd "${LAST05_ROOT}/scripts"
-source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
+source "${CONDA_BASE}/bin/activate" "${CONDA_ENV_PATH}"
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
-export PATH=/root/miniconda3/envs/last05/bin:$PATH
+export PATH="${CONDA_ENV_PATH}/bin:$PATH"
 export PYTHONPATH="${LAST05_ROOT}:${PYTHONPATH:-}"
-export PATH=/media/miniconda3/envs/last05.1/bin:$PATH
+LEGACY_LAST05_1_BIN="${LEGACY_LAST05_1_BIN:-/media/miniconda3/envs/last05.1/bin}"
+if [[ -d "${LEGACY_LAST05_1_BIN}" ]]; then
+  export PATH="${LEGACY_LAST05_1_BIN}:$PATH"
+fi
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
@@ -19,12 +46,12 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_trex_mot2_libero_spatial}"
 RUN_NAME="${RUN_NAME:-cosmos2B_trex2B_mot2_libero_spatial}"
 OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_trex_action_spatial}"
 
-DATA_JSON="${DATA_JSON:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/train_with_atomic_action.json}"
-ACTION_EXPERT_PATH="${ACTION_EXPERT_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
-COSMOS_PT_PATH="${COSMOS_PT_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
+DATA_JSON="${DATA_JSON:-${DATABASE_ROOT}/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/train_with_atomic_action.json}"
+ACTION_EXPERT_PATH="${ACTION_EXPERT_PATH:-${PRETRAINED_ROOT}/T-Rex_pretrain_mecka22k_epoch1}"
+COSMOS_PT_PATH="${COSMOS_PT_PATH:-${PRETRAINED_ROOT}/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXP_NAME="${COSMOS_EXP_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 
-COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_raw_full_concat}"
+COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-${DATABASE_ROOT}/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_raw_full_concat}"
 
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 TRAIN_BSZ="${TRAIN_BSZ:-8}"
@@ -66,7 +93,7 @@ SPATIAL_HIDDEN_SIM_LOSS_MODE="${SPATIAL_HIDDEN_SIM_LOSS_MODE:-siglip}"
 SPATIAL_HIDDEN_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT:-1.0}"
 USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS="${USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS:-0}"
 SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT:-1.0}"
-WAN21_VAE_PATH="${WAN21_VAE_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/wan2.1_vae/original/Wan2.1_VAE.pth}"
+WAN21_VAE_PATH="${WAN21_VAE_PATH:-${PRETRAINED_ROOT}/wan2.1_vae/original/Wan2.1_VAE.pth}"
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-8}"
 BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
 

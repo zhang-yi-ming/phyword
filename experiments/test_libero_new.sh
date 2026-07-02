@@ -1,11 +1,32 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAST05_ROOT="${LAST05_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+LAST05_BETA_ROOT="${LAST05_BETA_ROOT:-$(cd "${LAST05_ROOT}/.." && pwd)}"
 
-LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_trex_action}"
-COSMOS_ROOT="/mnt/nas/zhangyiming/experiments"
-LIBERO_ROOT="/mnt/nas/zhangxuheng/LIBERO"
-EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments}"
+for _last05_env in "${LAST05_LOCAL_ENV:-}" "${LAST05_BETA_ROOT}/last05_local_env.sh" "${LAST05_ROOT}/last05_local_env.sh"; do
+  if [[ -n "${_last05_env}" && -f "${_last05_env}" ]]; then
+    # shellcheck disable=SC1090
+    source "${_last05_env}"
+    break
+  fi
+done
+
+DATABASE_ROOT="${DATABASE_ROOT:-/mnt/nas/zhangyiming/database}"
+PRETRAINED_ROOT="${PRETRAINED_ROOT:-${DATABASE_ROOT}/ckpt/pretrained}"
+REQUIRES_ROOT="${REQUIRES_ROOT:-/mnt/nas/zhangyiming/requires}"
+CONDA_BASE="${CONDA_BASE:-/root/miniconda3}"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-last05}"
+CONDA_ENV_PATH="${CONDA_ENV_PATH:-${CONDA_BASE}/envs/${CONDA_ENV_NAME}}"
+EXPERIMENTS_LIBERO_ROOT="${EXPERIMENTS_LIBERO_ROOT:-${LAST05_BETA_ROOT}/experiments}"
+EXPERIMENTS_RLBENCH_ROOT="${EXPERIMENTS_RLBENCH_ROOT:-${LAST05_BETA_ROOT}/experiments_rlbench}"
+COSMOS_ROOT="${COSMOS_ROOT:-/mnt/nas/zhangyiming/experiments}"
+LIBERO_ROOT="${LIBERO_ROOT:-/mnt/nas/zhangxuheng/LIBERO}"
+PYREP_PYTHON_PATH="${PYREP_PYTHON_PATH:-/mnt/nas/zhangyawen/zhangyiming/python_pkgs}"
+LIFT3D_ROOT="${LIFT3D_ROOT:-${REQUIRES_ROOT}/LIFT3D}"
+RLBENCH_ROOT="${RLBENCH_ROOT:-${LIFT3D_ROOT}/third_party/RLBench}"
+EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-${EXPERIMENTS_LIBERO_ROOT:-${LAST05_BETA_ROOT}/experiments}}"
 
 RUN_NAME_FOR_LOG="${RUN_NAME:-cosmos2B_trex2B_mot2_libero_spatial}"
 LOG_DIR="${EXPERIMENTS_ROOT}/shell"
@@ -64,9 +85,9 @@ else
     exit 1
   fi
 fi
-JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
-ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
-COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-${PRETRAINED_ROOT}/T-Rex_pretrain_mecka22k_epoch1}"
+ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-${PRETRAINED_ROOT}/T-Rex_pretrain_mecka22k_epoch1}"
+COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-${PRETRAINED_ROOT}/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 
 # Bridge position schemes: mrope, mrope_interleave, llama1d
@@ -130,8 +151,8 @@ write_hparam() {
 } > "$BASH_HPARAMS_FILE"
 
 cd "$LAST05_ROOT"
-source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
-export PATH=/root/miniconda3/envs/last05/bin:$PATH
+source "${CONDA_BASE}/bin/activate" "${CONDA_ENV_PATH}"
+export PATH="${CONDA_ENV_PATH}/bin:$PATH"
 #export HF_HOME=/media/huggingFace
 export PYTHONPATH="${LAST05_ROOT}:${LIBERO_ROOT}:${COSMOS_ROOT}:${PYTHONPATH:-}"
 export WANDB_MODE=offline
