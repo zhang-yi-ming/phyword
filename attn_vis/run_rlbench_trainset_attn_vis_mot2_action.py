@@ -38,6 +38,9 @@ from models.cosmos_janus_action_spatial import (  # noqa: E402
 )
 from scripts.train_mot2_rlbench_keyframe import (  # noqa: E402
     VLACotDataset,
+    build_front_pic_path,
+    clipped_keyframe_indices,
+    parse_front_pic_index,
     resolve_rlbench_episode_key,
 )
 from utils.cosmos_text_cache import CosmosQwenTextEmbedder, CosmosTextEmbeddingCache  # noqa: E402
@@ -117,7 +120,7 @@ class TrainsetAttnVisConfig:
     attention_visualization_dir: str = ""
     attention_visualization_tile_size: int = 256
     attention_visualization_alpha: float = 0.45
-    attention_visualization_capture_mode: str = "all"
+    attention_visualization_capture_mode: str = "last"
     attention_visualization_top_ratio: Optional[float] = None
     attention_visualization_top_softness: float = 0.05
     bash_hparams_path: str = ""
@@ -459,6 +462,22 @@ def _colorize_heatmap(values: np.ndarray) -> np.ndarray:
     return (np.stack([red, green, blue], axis=-1) * 255.0).astype(np.uint8)
 
 
+def _score_to_rgb(score: float) -> tuple[int, int, int]:
+    score = float(np.clip(score, 0.0, 1.0))
+    low = np.array([80.0, 145.0, 255.0], dtype=np.float32)
+    high = np.array([255.0, 48.0, 42.0], dtype=np.float32)
+    rgb = low * (1.0 - score) + high * score
+    return tuple(int(round(v)) for v in rgb)
+
+
+def _draw_text_with_outline(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, fill, font=None) -> None:
+    x, y = int(xy[0]), int(xy[1])
+    outline = (4, 6, 10)
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        draw.text((x + dx, y + dy), text, fill=outline, font=font)
+    draw.text((x, y), text, fill=fill, font=font)
+
+
 def _smoothstep(values: np.ndarray) -> np.ndarray:
     values = np.clip(values, 0.0, 1.0)
     return values * values * (3.0 - 2.0 * values)
@@ -529,24 +548,26 @@ class AttentionMapRecorder:
         self.tile_size = max(16, int(getattr(cfg, "attention_visualization_tile_size", 256) or 256))
         self.top_ratio = getattr(cfg, "attention_visualization_top_ratio", None)
         self.top_softness = float(getattr(cfg, "attention_visualization_top_softness", 0.05) or 0.0)
-        self.capture_mode = str(getattr(cfg, "attention_visualization_capture_mode", "all") or "all").lower()
+        self.capture_mode = str(getattr(cfg, "attention_visualization_capture_mode", "last") or "last").lower()
         if self.capture_mode not in {"all", "first", "last"}:
             raise ValueError(f"attention_visualization_capture_mode must be all/first/last, got {self.capture_mode!r}.")
         self.active = False
         self.image_token_mask = None
-        self.base_image = None
+        self.action_base_image = None
+        self.cosmos_cond_base_image = None
+        self.cosmos_future_base_image = None
         self.metadata = {}
         self.action_denoise_step = -1
         self.spatial_call_index = -1
-        self.action_records: dict[int, dict[int, torch.Tensor]] = {}
-        self.spatial_records: dict[int, dict[int, torch.Tensor]] = {}
-        self.spatial_labels: dict[int, str] = {}
+        self.capture_current_action_step = False
+        self.summary_records: dict[str, dict[int, dict[str, dict[str, Any]]]] = {}
 
     def start_query(
         self,
         *,
         image_token_mask: torch.Tensor,
         base_image: Image.Image,
+        cosmos_future_image: Optional[Image.Image],
         task_name: str,
         episode_index: int,
         record_index: int,
@@ -559,7 +580,12 @@ class AttentionMapRecorder:
             return
         self.active = True
         self.image_token_mask = image_token_mask.detach()
-        self.base_image = base_image.copy().convert("RGB")
+        self.action_base_image = base_image.copy().convert("RGB")
+        self.cosmos_cond_base_image = base_image.copy().convert("RGB")
+        if cosmos_future_image is None:
+            self.cosmos_future_base_image = base_image.copy().convert("RGB")
+        else:
+            self.cosmos_future_base_image = cosmos_future_image.copy().convert("RGB")
         self.metadata = {
             "task_name": str(task_name),
             "episode_index": int(episode_index),
@@ -570,9 +596,8 @@ class AttentionMapRecorder:
         }
         self.action_denoise_step = -1
         self.spatial_call_index = -1
-        self.action_records = {}
-        self.spatial_records = {}
-        self.spatial_labels = {}
+        self.capture_current_action_step = False
+        self.summary_records = {}
 
     def finish_query(self) -> list[str]:
         if not self.active:
@@ -585,13 +610,14 @@ class AttentionMapRecorder:
     def discard_query(self) -> None:
         self.active = False
         self.image_token_mask = None
-        self.base_image = None
+        self.action_base_image = None
+        self.cosmos_cond_base_image = None
+        self.cosmos_future_base_image = None
         self.metadata = {}
         self.action_denoise_step = -1
         self.spatial_call_index = -1
-        self.action_records = {}
-        self.spatial_records = {}
-        self.spatial_labels = {}
+        self.capture_current_action_step = False
+        self.summary_records = {}
 
     def _image_positions(self, *, device: torch.device, action_seq_len: int) -> torch.Tensor:
         if self.image_token_mask is None:
@@ -617,69 +643,149 @@ class AttentionMapRecorder:
         raise ValueError(f"Expected square Janus image-token grid, got {image_token_count} tokens.")
 
     @staticmethod
-    def _mean_image_attention(q_tokens: torch.Tensor, k_image: torch.Tensor) -> torch.Tensor:
+    def _full_attention(q_tokens: torch.Tensor, k_tokens: torch.Tensor, allowed_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if q_tokens.ndim != 3 or k_tokens.ndim != 3:
+            raise ValueError(f"Expected q/k shapes [Q,H,D]/[K,H,D], got {tuple(q_tokens.shape)} and {tuple(k_tokens.shape)}.")
         scale = 1.0 / math.sqrt(float(q_tokens.shape[-1]))
-        scores = torch.einsum("qhd,khd->qhk", q_tokens.to(torch.float32), k_image.to(torch.float32)) * scale
-        return torch.softmax(scores, dim=-1).mean(dim=1)
+        scores = torch.einsum("qhd,khd->qhk", q_tokens.to(torch.float32), k_tokens.to(torch.float32)) * scale
+        if allowed_mask is not None:
+            allowed = allowed_mask.to(device=scores.device, dtype=torch.bool)
+            expected = (int(q_tokens.shape[0]), int(k_tokens.shape[0]))
+            if tuple(allowed.shape) != expected:
+                raise ValueError(f"Attention mask rows must have shape {expected}, got {tuple(allowed.shape)}.")
+            scores = scores.masked_fill(~allowed[:, None, :], torch.finfo(scores.dtype).min)
+        attn = torch.softmax(scores, dim=-1).mean(dim=1)
+        return torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def capture_spatial_attention(self, *, layer_idx: int, q_suffix: torch.Tensor, k_action: torch.Tensor, label: str) -> None:
-        if not self.active:
-            return
-        if q_suffix.shape[0] != 1 or k_action.shape[0] != 1:
-            raise ValueError(
-                "Attention visualization currently expects batch size 1, "
-                f"got q_suffix={tuple(q_suffix.shape)}, k_action={tuple(k_action.shape)}."
-            )
-        if int(layer_idx) == 0:
-            self.spatial_call_index += 1
-            self.spatial_records[self.spatial_call_index] = {}
-            self.spatial_labels[self.spatial_call_index] = str(label)
-        if self.spatial_call_index < 0:
-            raise RuntimeError("Spatial recorder saw a nonzero layer before layer 0.")
-        image_positions = self._image_positions(device=k_action.device, action_seq_len=k_action.shape[1])
-        image_keys = k_action[0, image_positions, :, :]
-        attn = self._mean_image_attention(q_suffix[0], image_keys)
-        self.spatial_records[self.spatial_call_index][int(layer_idx)] = attn.detach().cpu()
+    def _resolve_video_grid(self, video_grid_thw: Optional[torch.Tensor], video_len: int) -> tuple[int, int, int]:
+        if video_grid_thw is not None:
+            grid = video_grid_thw.detach().to(device="cpu", dtype=torch.long)
+            if grid.ndim == 2:
+                grid = grid[0]
+            if int(grid.numel()) == 3:
+                t, h, w = (int(grid[0].item()), int(grid[1].item()), int(grid[2].item()))
+                if t > 0 and h > 0 and w > 0 and t * h * w == int(video_len):
+                    return t, h, w
+        t = max(1, int(getattr(self.cfg, "total_video_latent_frames", 1) or 1))
+        spatial = int(video_len) // t if int(video_len) % t == 0 else int(video_len)
+        side = int(round(math.sqrt(spatial)))
+        if t * side * side == int(video_len):
+            return t, side, side
+        side = int(round(math.sqrt(int(video_len))))
+        if side * side == int(video_len):
+            return 1, side, side
+        raise ValueError(f"Could not resolve Cosmos video grid for {video_len} tokens.")
 
-    def capture_action_attention(
+    def _video_region_record(
         self,
         *,
+        attn: torch.Tensor,
+        video_grid_thw: Optional[torch.Tensor],
+        video_len: int,
+        region: str,
+    ) -> dict[str, Any]:
+        t, h, w = self._resolve_video_grid(video_grid_thw, video_len)
+        cond_frames = int(getattr(self.cfg, "num_cond_latent_frames", 1) or 1)
+        cond_frames = max(1, min(cond_frames, t))
+        if region == "cosmos_cond":
+            start_t, end_t = 0, cond_frames
+        elif region == "cosmos_future":
+            start_t, end_t = cond_frames, t
+        else:
+            raise ValueError(f"Unknown Cosmos attention region: {region}")
+        start = start_t * h * w
+        end = end_t * h * w
+        if end <= start:
+            return {"heat": np.zeros((h, w), dtype=np.float32), "score": 0.0}
+        region_attn = attn[:, start:end]
+        score = float(region_attn.sum(dim=-1).mean().detach().cpu().item())
+        flat = region_attn.mean(dim=0).detach().to(torch.float32).cpu()
+        heat = flat.reshape(end_t - start_t, h, w).sum(dim=0).numpy().astype(np.float32)
+        return {"heat": heat, "score": score}
+
+    def _action_image_region_record(self, *, attn: torch.Tensor, video_len: int, action_seq_len: int) -> dict[str, Any]:
+        image_positions = self._image_positions(device=attn.device, action_seq_len=action_seq_len)
+        full_positions = image_positions + int(video_len)
+        if int(full_positions[-1].item()) >= int(attn.shape[1]):
+            raise ValueError(
+                "Image token positions do not fit full KV sequence: "
+                f"max_full_pos={int(full_positions[-1].item())}, full_k_len={int(attn.shape[1])}."
+            )
+        region_attn = attn[:, full_positions]
+        score = float(region_attn.sum(dim=-1).mean().detach().cpu().item())
+        flat = region_attn.mean(dim=0).detach().to(torch.float32).cpu()
+        grid_h, grid_w = self._grid_shape(int(flat.numel()))
+        heat = flat.reshape(grid_h, grid_w).numpy().astype(np.float32)
+        return {"heat": heat, "score": score}
+
+    def _target_action_step(self) -> int:
+        if self.capture_mode == "first":
+            return 0
+        return max(0, int(self.metadata.get("action_denoise_steps", 1)) - 1)
+
+    def capture_summary_attention(
+        self,
+        *,
+        query_kind: str,
         layer_idx: int,
-        q_suffix: torch.Tensor,
-        k_prefix: torch.Tensor,
-        k_suffix: torch.Tensor,
+        q_tokens: torch.Tensor,
+        k_video: torch.Tensor,
+        k_action: torch.Tensor,
+        allowed_mask: Optional[torch.Tensor],
+        video_grid_thw: Optional[torch.Tensor],
     ) -> None:
         if not self.active:
             return
-        if q_suffix.shape[0] != 1 or k_prefix.shape[0] != 1 or k_suffix.shape[0] != 1:
+        if q_tokens.shape[0] != 1 or k_video.shape[0] != 1 or k_action.shape[0] != 1:
             raise ValueError(
                 "Attention visualization currently expects batch size 1, "
-                f"got q_suffix={tuple(q_suffix.shape)}, k_prefix={tuple(k_prefix.shape)}, "
-                f"k_suffix={tuple(k_suffix.shape)}."
+                f"got q_tokens={tuple(q_tokens.shape)}, k_video={tuple(k_video.shape)}, k_action={tuple(k_action.shape)}."
             )
-        if int(layer_idx) == 0:
-            self.action_denoise_step += 1
-            self.action_records[self.action_denoise_step] = {}
-        if self.action_denoise_step < 0:
-            raise RuntimeError("Action recorder saw a nonzero layer before layer 0.")
-        image_positions = self._image_positions(
-            device=k_prefix.device,
-            action_seq_len=k_prefix.shape[1] + k_suffix.shape[1],
-        )
-        image_keys = k_prefix[0, image_positions, :, :]
-        q_tokens = q_suffix[0]
-        expected = 1 + self.action_chunk
-        if int(q_tokens.shape[0]) != expected:
-            raise ValueError(f"Expected suffix queries time+{self.action_chunk} actions={expected}, got {q_tokens.shape[0]}.")
-        attn = self._mean_image_attention(q_tokens, image_keys)
-        self.action_records[self.action_denoise_step][int(layer_idx)] = attn.detach().cpu()
+        layer_idx = int(layer_idx)
+        query_kind = str(query_kind)
+        if query_kind == "spatial":
+            if layer_idx == 0:
+                self.spatial_call_index += 1
+            if self.spatial_call_index < 0:
+                raise RuntimeError("Spatial recorder saw a nonzero layer before layer 0.")
+            label = f"spatial{self.spatial_call_index}"
+            if label not in {"spatial0", "spatial1"}:
+                return
+        elif query_kind == "action":
+            if layer_idx == 0:
+                self.action_denoise_step += 1
+                self.capture_current_action_step = self.action_denoise_step == self._target_action_step()
+            if self.action_denoise_step < 0:
+                raise RuntimeError("Action recorder saw a nonzero layer before layer 0.")
+            if not self.capture_current_action_step:
+                return
+            label = "action"
+        else:
+            raise ValueError(f"Unknown attention query kind: {query_kind}")
 
-    def _should_save_action_step(self, denoise_step: int) -> bool:
-        if self.capture_mode == "all":
-            return True
-        if self.capture_mode == "first":
-            return int(denoise_step) == 0
-        return int(denoise_step) == int(self.metadata["action_denoise_steps"]) - 1
+        video_len = int(k_video.shape[1])
+        full_k = torch.cat([k_video, k_action], dim=1)
+        attn = self._full_attention(q_tokens[0], full_k[0], allowed_mask)
+        record = {
+            "cosmos_cond": self._video_region_record(
+                attn=attn,
+                video_grid_thw=video_grid_thw,
+                video_len=video_len,
+                region="cosmos_cond",
+            ),
+            "cosmos_future": self._video_region_record(
+                attn=attn,
+                video_grid_thw=video_grid_thw,
+                video_len=video_len,
+                region="cosmos_future",
+            ),
+            "action_image": self._action_image_region_record(
+                attn=attn,
+                video_len=video_len,
+                action_seq_len=int(k_action.shape[1]),
+            ),
+        }
+        self.summary_records.setdefault(label, {})[layer_idx] = record
 
     def _query_dir(self) -> Path:
         task_name = _sanitize_filename(str(self.metadata["task_name"]))
@@ -698,18 +804,28 @@ class AttentionMapRecorder:
         )
         return self._query_dir() / filename
 
-    def _render_overview(self, layer_maps: dict[int, torch.Tensor], col_labels: list[str]) -> Image.Image:
+    def _summary_columns(self) -> list[tuple[str, str, Image.Image, str]]:
+        if self.action_base_image is None or self.cosmos_cond_base_image is None or self.cosmos_future_base_image is None:
+            raise RuntimeError("Attention recorder has no base images for the active query.")
+        return [
+            ("spatial0", "cosmos_cond", self.cosmos_cond_base_image, "s0 -> cosmos cond"),
+            ("spatial0", "cosmos_future", self.cosmos_future_base_image, "s0 -> cosmos future"),
+            ("spatial0", "action_image", self.action_base_image, "s0 -> action img"),
+            ("spatial1", "cosmos_cond", self.cosmos_cond_base_image, "s1 -> cosmos cond"),
+            ("spatial1", "cosmos_future", self.cosmos_future_base_image, "s1 -> cosmos future"),
+            ("spatial1", "action_image", self.action_base_image, "s1 -> action img"),
+            ("action", "cosmos_cond", self.cosmos_cond_base_image, "act -> cosmos cond"),
+            ("action", "cosmos_future", self.cosmos_future_base_image, "act -> cosmos future"),
+            ("action", "action_image", self.action_base_image, "act -> action img"),
+        ]
+
+    def _render_summary_overview(self) -> Image.Image:
         row_label_w = 86
-        col_label_h = 42
-        if self.base_image is None:
-            raise RuntimeError("Attention recorder has no base image for the active query.")
-        num_cols = len(col_labels)
-        first_layer = next(iter(layer_maps.values()))
-        image_token_count = int(first_layer.shape[1])
-        grid_h, grid_w = self._grid_shape(image_token_count)
+        col_label_h = 44
+        columns = self._summary_columns()
         canvas = Image.new(
             "RGB",
-            (row_label_w + num_cols * self.tile_size, col_label_h + self.num_layers * self.tile_size),
+            (row_label_w + len(columns) * self.tile_size, col_label_h + self.num_layers * self.tile_size),
             (18, 22, 28),
         )
         draw = ImageDraw.Draw(canvas)
@@ -717,49 +833,47 @@ class AttentionMapRecorder:
             font = ImageFont.load_default()
         except Exception:
             font = None
-        for col_idx, label in enumerate(col_labels):
+        for col_idx, (_, _, _, label) in enumerate(columns):
             x = row_label_w + col_idx * self.tile_size + 5
             draw.text((x, 13), label, fill=(245, 248, 252), font=font)
         for layer_idx in range(self.num_layers):
             y = col_label_h + layer_idx * self.tile_size
             draw.text((8, y + max(4, self.tile_size // 2 - 6)), f"layer_{layer_idx:02d}", fill=(245, 248, 252), font=font)
-            maps = layer_maps[layer_idx]
-            expected_shape = (num_cols, image_token_count)
-            if tuple(maps.shape) != expected_shape:
-                raise ValueError(f"Layer {layer_idx} attention map shape must be {expected_shape}, got {tuple(maps.shape)}.")
-            for col_idx in range(num_cols):
-                heat = maps[col_idx].reshape(grid_h, grid_w).numpy()
-                overlay = _overlay_heatmap(self.base_image, heat, self.tile_size, self.alpha, self.top_ratio, self.top_softness)
+            for col_idx, (query_label, region_name, base_image, _) in enumerate(columns):
+                record = self.summary_records[query_label][layer_idx][region_name]
+                heat = np.asarray(record["heat"], dtype=np.float32)
+                score = float(record["score"])
+                overlay = _overlay_heatmap(base_image, heat, self.tile_size, self.alpha, self.top_ratio, self.top_softness)
+                tile_draw = ImageDraw.Draw(overlay)
+                _draw_text_with_outline(tile_draw, (7, 5), f"{score:.3f}", fill=_score_to_rgb(score), font=font)
                 canvas.paste(overlay, (row_label_w + col_idx * self.tile_size, y))
         return canvas
 
     def _save_query(self) -> list[str]:
-        if not self.spatial_records and not self.action_records:
+        if not self.summary_records:
             raise RuntimeError("No attention maps were captured for the active query.")
+        required = ["spatial0", "spatial1", "action"]
+        missing_queries = [label for label in required if label not in self.summary_records]
+        if missing_queries:
+            raise RuntimeError(f"Missing attention summary query records: {missing_queries}.")
+        for label in required:
+            missing_layers = [idx for idx in range(self.num_layers) if idx not in self.summary_records[label]]
+            if missing_layers:
+                raise RuntimeError(f"Missing summary maps for {label}: layers={missing_layers[:8]}.")
+            for layer_idx in range(self.num_layers):
+                missing_regions = [
+                    region for region in ("cosmos_cond", "cosmos_future", "action_image")
+                    if region not in self.summary_records[label][layer_idx]
+                ]
+                if missing_regions:
+                    raise RuntimeError(f"Missing summary regions for {label} layer={layer_idx}: {missing_regions}.")
         query_dir = self._query_dir()
         os.makedirs(query_dir, exist_ok=True)
-        saved_paths = []
-        for spatial_idx, layer_maps in sorted(self.spatial_records.items()):
-            missing_layers = [idx for idx in range(self.num_layers) if idx not in layer_maps]
-            if missing_layers:
-                raise RuntimeError(f"Missing spatial maps for call={spatial_idx}: layers={missing_layers[:8]}.")
-            overview = self._render_overview(layer_maps, [self.spatial_labels.get(spatial_idx, f"spatial_{spatial_idx:02d}")])
-            path = self._output_path("spatial", spatial_idx)
-            overview.save(path)
-            saved_paths.append(str(path))
-        action_labels = ["time"] + [f"action_{idx:02d}" for idx in range(self.action_chunk)]
-        for denoise_step, layer_maps in sorted(self.action_records.items()):
-            if not self._should_save_action_step(denoise_step):
-                continue
-            missing_layers = [idx for idx in range(self.num_layers) if idx not in layer_maps]
-            if missing_layers:
-                raise RuntimeError(f"Missing action maps for denoise_step={denoise_step}: layers={missing_layers[:8]}.")
-            overview = self._render_overview(layer_maps, action_labels)
-            path = self._output_path("denoise", denoise_step)
-            overview.save(path)
-            saved_paths.append(str(path))
-        log_message(f"Saved {len(saved_paths)} attention overview PNGs to {query_dir}", self.log_file)
-        return saved_paths
+        overview = self._render_summary_overview()
+        path = self._output_path("summary", self._target_action_step())
+        overview.save(path)
+        log_message(f"Saved attention summary PNG to {path}", self.log_file)
+        return [str(path)]
 
 
 def install_attention_map_recorder(model, cfg: TrainsetAttnVisConfig, log_file=None) -> Optional[AttentionMapRecorder]:
@@ -799,11 +913,14 @@ def install_attention_map_recorder(model, cfg: TrainsetAttnVisConfig, log_file=N
                     suffix_valid_mask=action_valid_mask,
                     action_tail_token_count=action_tail_token_count,
                 )
-                recorder.capture_spatial_attention(
+                recorder.capture_summary_attention(
+                    query_kind="spatial",
                     layer_idx=layer_idx,
-                    q_suffix=q_a,
+                    q_tokens=q_a,
+                    k_video=self.cached_k_v,
                     k_action=torch.cat([self.cached_k_a_prefix, k_a], dim=1),
-                    label=f"spatial_token_{recorder.spatial_call_index:02d}",
+                    allowed_mask=mask[0, 0],
+                    video_grid_thw=self.cached_video_grid_thw,
                 )
             else:
                 k = torch.cat([self.cached_k_v, k_a], dim=1)
@@ -818,17 +935,25 @@ def install_attention_map_recorder(model, cfg: TrainsetAttnVisConfig, log_file=N
                 if append_to_cache:
                     if action_valid_mask is None:
                         q_for_spatial = q_a[:, -1:, :, :]
+                        q_allowed_mask = mask[0, 0, -1:, :]
                     else:
                         valid = action_valid_mask.to(device=q_a.device, dtype=torch.bool)
                         positions = torch.arange(S_a, device=q_a.device, dtype=torch.long).unsqueeze(0)
                         last_valid = torch.where(valid, positions, torch.zeros_like(positions)).max(dim=1).values
                         gather_idx = last_valid.view(-1, 1, 1, 1).expand(-1, 1, q_a.shape[2], q_a.shape[3])
                         q_for_spatial = q_a.gather(1, gather_idx)
-                    recorder.capture_spatial_attention(
+                        if int(last_valid.numel()) != 1:
+                            raise ValueError(f"Attention visualization expects batch size 1, got last_valid={tuple(last_valid.shape)}.")
+                        row_idx = int(last_valid[0].item())
+                        q_allowed_mask = mask[0, 0, row_idx : row_idx + 1, :]
+                    recorder.capture_summary_attention(
+                        query_kind="spatial",
                         layer_idx=layer_idx,
-                        q_suffix=q_for_spatial,
+                        q_tokens=q_for_spatial,
+                        k_video=self.cached_k_v,
                         k_action=k_a,
-                        label="spatial_predict_00",
+                        allowed_mask=q_allowed_mask,
+                        video_grid_thw=self.cached_video_grid_thw,
                     )
             query_valid_mask = action_valid_mask
             if query_valid_mask is None:
@@ -882,11 +1007,17 @@ def install_attention_map_recorder(model, cfg: TrainsetAttnVisConfig, log_file=N
             query_valid_mask = suffix_valid_mask
             if query_valid_mask is None:
                 query_valid_mask = torch.ones((q_a.shape[0], S_suffix), device=q_a.device, dtype=torch.bool)
-            recorder.capture_action_attention(
+            expected = 1 + int(recorder.action_chunk)
+            if int(q_a.shape[1]) != expected:
+                raise ValueError(f"Expected suffix queries time+{recorder.action_chunk} actions={expected}, got {q_a.shape[1]}.")
+            recorder.capture_summary_attention(
+                query_kind="action",
                 layer_idx=layer_idx,
-                q_suffix=q_a,
-                k_prefix=self.cached_k_a_prefix,
-                k_suffix=k_a,
+                q_tokens=q_a[:, 1:, :, :],
+                k_video=self.cached_k_v,
+                k_action=torch.cat([self.cached_k_a_prefix, k_a], dim=1),
+                allowed_mask=mask[0, 0, 1:, :],
+                video_grid_thw=self.cached_video_grid_thw,
             )
             result = self._bridge_sdpa(q_a, k, v, attn_mask=mask, query_valid_mask=query_valid_mask)
             return self.action_bridge.post_attention(x_action_suffix, result, token_valid_mask=suffix_valid_mask)
@@ -978,6 +1109,20 @@ def action_summary(pred_action: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def load_visualization_future_frame(dataset: VLACotDataset, sample: dict[str, Any], cfg: TrainsetAttnVisConfig) -> Image.Image:
+    cur = parse_front_pic_index(sample["front_pic"])
+    pic_num = int(sample["pic_num"])
+    indices = clipped_keyframe_indices(
+        cur,
+        pic_num,
+        int(cfg.video_frames),
+        int(cfg.num_cond_input_frames),
+    )
+    target_idx = int(indices[-1])
+    frame_path = build_front_pic_path(dataset._resolve_data_path(sample["front_pic"]), target_idx)
+    return dataset._load_image_pil(frame_path)
+
+
 def run_selected_records(
     cfg: TrainsetAttnVisConfig,
     dataset: VLACotDataset,
@@ -1004,6 +1149,7 @@ def run_selected_records(
             item = dataset[sample_index]
             batch = move_batch_to_device(dataset.collate_fn([item]), device, dtype)
             base_image = dataset._load_image_pil(sample["front_pic"])
+            future_image = load_visualization_future_frame(dataset, sample, cfg)
             now_state = batch.get("now_state")
             cosmos_text_embeddings = batch.get("cosmos_text_embeddings")
             if cosmos_text_embeddings is not None:
@@ -1011,6 +1157,7 @@ def run_selected_records(
             recorder.start_query(
                 image_token_mask=batch["janus_images_seq_mask"].detach().cpu(),
                 base_image=base_image,
+                cosmos_future_image=future_image,
                 task_name=task_name,
                 episode_index=episode_index,
                 record_index=record_index,

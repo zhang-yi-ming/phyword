@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action_fis}"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments_rlbench}"
-OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial_rlbench_keyframe}"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_fis_spatial_rlbench_keyframe}"
 PYREP_PYTHON_PATH="${PYREP_PYTHON_PATH:-/mnt/nas/zhangyawen/zhangyiming/python_pkgs}"
 LIFT3D_ROOT="${LIFT3D_ROOT:-/mnt/nas/zhangyiming/requires/LIFT3D}"
 RLBENCH_ROOT="${RLBENCH_ROOT:-${LIFT3D_ROOT}/third_party/RLBench}"
@@ -13,7 +13,7 @@ mkdir -p "$LOG_DIR"
 EVAL_TIMESTAMP="$(date +%Y_%m_%d-%H_%M_%S)"
 SHELL_LOG="$LOG_DIR/test_rlbench_keyframe_shell_${EVAL_TIMESTAMP}.log"
 
-RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_rlbench_keyframe_spatial_n}"
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_fis_rlbench_keyframe_spatial_v_new}"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-}"
 RUN_DIR="${OUTPUT_ROOT_DIR}/${RUN_NAME}"
 if [[ -n "${PRETRAINED_CHECKPOINT:-}" ]]; then
@@ -40,7 +40,7 @@ JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrai
 ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
 COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
-COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-}"
+COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/rlbench/train/json/cosmos_text_cache_rlbench_keyframe}"
 TRAIN_PROMPT_JSON_PATH="${TRAIN_PROMPT_JSON_PATH:-/mnt/nas/zhangyiming/database/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"
 
 DEFAULT_TASK_NAMES="close_box,close_laptop_lid,sweep_to_dustpan,phone_on_base,toilet_seat_down,close_fridge,place_wine_at_rack_location,water_plants,take_umbrella_out_of_umbrella_stand,take_frame_off_hanger"
@@ -77,8 +77,8 @@ ACTION_DIM=7
 ACTION_CHUNK=1
 VIDEO_H="${VIDEO_H:-256}"
 VIDEO_W="${VIDEO_W:-256}"
-VIDEO_FRAMES=5
-NUM_COND_INPUT_FRAMES=1
+VIDEO_FRAMES=9
+NUM_COND_INPUT_FRAMES=5
 ENV_IMG_RES="${ENV_IMG_RES:-224}"
 TOTAL_LATENT_TOKENS="${TOTAL_LATENT_TOKENS:-1}"
 IMG_LATENTS_PER_FUTURE=0
@@ -154,8 +154,8 @@ trap 'rc=$?; echo "[ERROR] test_rlbench_keyframe_2expert.sh failed with exit cod
 } > "$BASH_HPARAMS_FILE"
 
 cd "$LAST05_ROOT"
-source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
-export PATH=/root/miniconda3/envs/last05/bin:$PATH
+source /root/miniconda3/bin/activate /root/miniconda3/envs/last05_qwen3vl
+export PATH=/root/miniconda3/envs/last05_qwen3vl/bin:$PATH
 export PYTHONPATH="${PYREP_PYTHON_PATH}:${LIFT3D_ROOT}:${RLBENCH_ROOT}:${LAST05_ROOT}:${PYTHONPATH:-}"
 export WANDB_MODE=offline
 export TOKENIZERS_PARALLELISM=false
@@ -184,7 +184,7 @@ export COPPELIASIM_ROOT
 if [[ -n "$QT_QPA_PLATFORM" ]]; then
   export QT_QPA_PLATFORM
 fi
-CONDA_ENV_LIB="/root/miniconda3/envs/last05/lib"
+CONDA_ENV_LIB="/root/miniconda3/envs/last05_qwen3vl/lib"
 PYTHON_EXTRA_LD_LIBRARY_PATH=""
 if [[ -d "$CONDA_ENV_LIB" ]]; then
   PYTHON_EXTRA_LD_LIBRARY_PATH="${PYTHON_EXTRA_LD_LIBRARY_PATH}:$CONDA_ENV_LIB"

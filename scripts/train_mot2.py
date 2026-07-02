@@ -3,8 +3,9 @@ Libero training entry for the 2-MoT Cosmos + Janus-action architecture.
 
 The old middle latent expert is removed. Spatial labels from the dataset are
 inserted into the Janus action sequence and supervised with next-token CE, while
-the final action tokens are supervised with flow matching. Janus is loaded only
-from --action_expert_path.
+the final action tokens are supervised with flow matching. By default Janus is
+loaded from --action_expert_path; optionally the base/tokenizer can come from
+Janus-Pro while only AE flow components are copied from --action_expert_path.
 """
 
 import os
@@ -887,19 +888,31 @@ def train(args):
 
     if not args.model_path:
         args.model_path = args.action_expert_path
-    processor = VLChatProcessor.from_pretrained(args.action_expert_path, trust_remote_code=True)
+    ae_fast_layer_state = None
+    janus_init_mode = str(getattr(args, "janus_init_mode", "ae") or "ae").strip().lower()
+    if janus_init_mode not in ("ae", "janus_pro_ae_flow"):
+        raise ValueError(
+            "--janus_init_mode must be one of ['ae', 'janus_pro_ae_flow'], "
+            f"got {args.janus_init_mode!r}."
+        )
+    if janus_init_mode == "janus_pro_ae_flow" and not str(getattr(args, "janus_pro_model_path", "") or "").strip():
+        raise ValueError("--janus_pro_model_path is required when --janus_init_mode=janus_pro_ae_flow.")
+
+    processor_path = args.janus_pro_model_path if janus_init_mode == "janus_pro_ae_flow" else args.action_expert_path
+    processor = VLChatProcessor.from_pretrained(processor_path, trust_remote_code=True)
     added_extra_special_tokens = processor.add_extra_special_tokens(args.extra_special_tokens)
     accelerator.print(f"extra_special_tokens={getattr(processor, 'extra_special_tokens', [])}")
     accelerator.print(f"added_extra_special_tokens={added_extra_special_tokens}")
 
     # ----------------------------------------------------------------
-    # Load the action expert only.  The two-MoT model uses the standard Janus
-    # language/vision/action-flow weights directly; there is no Janus-Pro latent
-    # expert and no _action-suffixed weight copy.
+    # Load Janus.  Legacy mode keeps the exact AE-only behavior.  The optional
+    # Janus-Pro mode keeps tokenizer/embed_tokens/lm_head/base weights from
+    # Janus-Pro and copies only AE flow components.
     # ----------------------------------------------------------------
-    accelerator.print("Loading Janus action expert checkpoint...")
+    janus_load_path = args.janus_pro_model_path if janus_init_mode == "janus_pro_ae_flow" else args.action_expert_path
+    accelerator.print(f"Loading Janus checkpoint from {janus_load_path} (janus_init_mode={janus_init_mode})...")
     janus_model, janus_model_loading_info, janus_model_unloaded_keys = load_causallm_with_loading_info(
-        args.action_expert_path,
+        janus_load_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         flow=True,
@@ -913,6 +926,65 @@ def train(args):
         f"mismatched={len(janus_model_loading_info.get('mismatched_keys', []))}, "
         f"unloaded_total={len(janus_model_unloaded_keys)})."
     )
+    if janus_init_mode == "janus_pro_ae_flow":
+        accelerator.print("Loading AE action expert checkpoint for flow component initialization...")
+        ae_model, ae_model_loading_info, ae_model_unloaded_keys = load_causallm_with_loading_info(
+            args.action_expert_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            flow=True,
+            action_dim=args.action_dim,
+            ignore_mismatched_sizes=True,
+        )
+        accelerator.print(
+            "Captured ae_model loading info "
+            f"(missing={len(ae_model_loading_info.get('missing_keys', []))}, "
+            f"unexpected={len(ae_model_loading_info.get('unexpected_keys', []))}, "
+            f"mismatched={len(ae_model_loading_info.get('mismatched_keys', []))}, "
+            f"unloaded_total={len(ae_model_unloaded_keys)})."
+        )
+        flow_component_names = ("x_embedder", "t_embedder", "final_layer", "state_embedder")
+        ae_layers = list(ae_model.language_model.model.layers)
+        ae_fast_layer_state = [
+            {k: v.detach().cpu().clone() for k, v in layer.state_dict().items()}
+            for layer in ae_layers[-4:]
+        ]
+        ae_state = ae_model.state_dict()
+        copied_flow_keys = []
+        missing_flow_keys = []
+        mismatched_flow_keys = []
+        for name, param in janus_model.named_parameters():
+            if not any(component in name for component in flow_component_names):
+                continue
+            ae_param = ae_state.get(name)
+            if ae_param is None:
+                missing_flow_keys.append(name)
+                continue
+            if tuple(ae_param.shape) != tuple(param.shape):
+                mismatched_flow_keys.append((name, tuple(param.shape), tuple(ae_param.shape)))
+                continue
+            param.data.copy_(ae_param.to(device=param.device, dtype=param.dtype))
+            copied_flow_keys.append(name)
+        del ae_state
+        del ae_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if not copied_flow_keys:
+            raise RuntimeError(
+                "janus_pro_ae_flow did not copy any AE flow component weights. "
+                "Expected keys containing x_embedder/t_embedder/final_layer/state_embedder."
+            )
+        if missing_flow_keys or mismatched_flow_keys:
+            raise RuntimeError(
+                "Failed to initialize all Janus flow components from AE checkpoint. "
+                f"missing={missing_flow_keys[:20]} total_missing={len(missing_flow_keys)}; "
+                f"mismatched={mismatched_flow_keys[:20]} total_mismatched={len(mismatched_flow_keys)}"
+            )
+        accelerator.print(
+            "Initialized AE flow components into Janus-Pro base while keeping Janus-Pro "
+            f"tokenizer/embed_tokens/lm_head. copied_keys={len(copied_flow_keys)}"
+        )
     ensure_janus_tokenizer_alignment(janus_model, processor.tokenizer, accelerator)
     initialize_action_special_token_rows(janus_model, processor.tokenizer, accelerator)
 
@@ -939,7 +1011,7 @@ def train(args):
     # ----------------------------------------------------------------
     # Build Cosmos + action MoT
     # ----------------------------------------------------------------
-    accelerator.print("Building 2-MoT Cosmos-Janus action-spatial VLA...")
+    accelerator.print("Building FiS 2-MoT Cosmos-Janus action-spatial VLA...")
     args.janus_image_start_id = processor.image_start_id
     args.janus_image_end_id = processor.image_end_id
     if args.janus_image_start_id is None:
@@ -966,7 +1038,22 @@ def train(args):
     args.use_action_value_prediction = 0
     model = CosmosJanusActionSpatialMoT2Expert(
         cosmos_wrapper.net, cosmos_wrapper.tokenizer, janus_model, args
-    ).to(accelerator.device, torch.bfloat16)
+    )
+    if janus_init_mode == "janus_pro_ae_flow":
+        fast_layers = list(getattr(model, "fast_action_layers", []))
+        if not fast_layers:
+            raise RuntimeError("FiS model has no fast_action_layers to initialize from AE.")
+        if ae_fast_layer_state is None or len(ae_fast_layer_state) < len(fast_layers):
+            raise RuntimeError(
+                "Missing AE fast layer state for FiS initialization: "
+                f"needed={len(fast_layers)}, available={0 if ae_fast_layer_state is None else len(ae_fast_layer_state)}."
+            )
+        for dst_layer, src_state in zip(fast_layers, ae_fast_layer_state[-len(fast_layers):]):
+            dst_layer.load_state_dict(src_state, strict=True)
+        accelerator.print(f"Initialized FiS fast_action_layers from AE last {len(fast_layers)} transformer layers.")
+        del ae_fast_layer_state
+        gc.collect()
+    model = model.to(accelerator.device, torch.bfloat16)
     accelerator.print(f"action_chunk={args.action_chunk}")
     accelerator.print(f"future_frame_stride={args.future_frame_stride}")
     accelerator.print(
@@ -987,7 +1074,7 @@ def train(args):
         f"cosmos_text_cache_enabled={int(bool(getattr(args, 'cosmos_text_cache_path', '')))}"
     )
     accelerator.print(
-        "action_context_prefix=image_prompt_spatial_time_action"
+        "action_context_prefix=fis_slow_image_prompt_spatial_fast_time_action"
     )
     accelerator.print(f"spatial_token_mode={getattr(args, 'latent_token_mode', 'v')}")
     accelerator.print(f"spatial_token_fields={','.join(getattr(args, 'latent_token_fields', ['gtlatent']))}")
@@ -1318,6 +1405,12 @@ if __name__ == '__main__':
                         help='Deprecated compatibility alias; action_expert_path is used for Janus loading.')
     parser.add_argument('--action_expert_path', type=str, required=True,
                         help='Path to action-only pretrained checkpoint (provides action expert + flow matching weights)')
+    parser.add_argument('--janus_init_mode', type=str, default='ae',
+                        choices=['ae', 'janus_pro_ae_flow'],
+                        help='ae keeps legacy behavior. janus_pro_ae_flow loads tokenizer/embed_tokens/lm_head/base Janus from Janus-Pro, then copies AE flow components.')
+    parser.add_argument('--janus_pro_model_path', type=str,
+                        default='/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B',
+                        help='Janus-Pro-1B checkpoint used when --janus_init_mode=janus_pro_ae_flow.')
 
     # Data
     parser.add_argument('--data_path', type=str, required=True)

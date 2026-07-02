@@ -2,19 +2,19 @@
 set -Eeuo pipefail
 
 
-LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action_fis}"
 COSMOS_ROOT="/mnt/nas/zhangyiming/experiments"
 LIBERO_ROOT="/mnt/nas/zhangxuheng/LIBERO"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments}"
 
-RUN_NAME_FOR_LOG="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
+RUN_NAME_FOR_LOG="${RUN_NAME:-cosmos2B_action1B_mot2_fis_libero_spatial}"
 LOG_DIR="${EXPERIMENTS_ROOT}/shell"
 mkdir -p "$LOG_DIR"
 EVAL_TIMESTAMP="${EVAL_TIMESTAMP:-$(date +%Y_%m_%d-%H_%M_%S)}"
 SHELL_LOG="${SHELL_LOG:-$LOG_DIR/test_libero_shell_${EVAL_TIMESTAMP}_${RUN_NAME_FOR_LOG}.log}"
 
-OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial}"
-RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_fis_spatial}"
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_fis_libero_spatial}"
 RUN_NAME_PREFIX="cosmos2B_action1B_mot2"
 EVAL_RUN_NAME="$RUN_NAME"
 if [[ "$EVAL_RUN_NAME" == "$RUN_NAME_PREFIX"* ]]; then
@@ -31,7 +31,7 @@ ROLLOUT_VIDEO_DIR="${EXPERIMENTS_ROOT}/rollouts/${EVAL_ARTIFACT_NAME}"
 VALUE_VIS_DIR="${EXPERIMENTS_ROOT}/value_visualizations/${EVAL_ARTIFACT_NAME}"
 BASH_HPARAMS_FILE="${LOG_DIR}/test_libero_hparams_${EVAL_ARTIFACT_NAME}.env"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-}"
-COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-}"
+COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_raw_full_concat}"
 LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${EXPERIMENTS_ROOT}/logs}"
 RUN_ID_NOTE="${RUN_ID_NOTE:-${EVAL_ARTIFACT_NAME}}"
 
@@ -89,8 +89,9 @@ ACTION_SELF_CAUSAL_IN_BRIDGE="true"
 TASK_SUITE_NAME="libero_spatial"
 VIDEO_H="${VIDEO_H:-256}"
 VIDEO_W="${VIDEO_W:-256}"
-VIDEO_FRAMES=1
-NUM_COND_INPUT_FRAMES=1
+VIDEO_FRAMES=17
+NUM_COND_INPUT_FRAMES=5
+ACTION_DIM=7
 ACTION_CHUNK=16
 CUDA_DEVICE=0
 SEED=0
@@ -122,15 +123,15 @@ write_hparam() {
     BRIDGE_POS_SCHEME IMG_LATENTS_PER_FUTURE STATE_LATENTS_PER_FUTURE NUM_FUTURE_FRAMES \
     TOTAL_LATENT_TOKENS FUTURE_FRAME_STRIDE ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_ENCODING_MODE \
     ACTION_INTERMEDIATE_SIZE ACTION_USE_LATENT_PREFIX DECOSMOS COSMOS_SELF_ONLY_BRIDGE ACTION_SELF_CAUSAL_IN_BRIDGE \
-    TASK_SUITE_NAME VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES ACTION_CHUNK CUDA_DEVICE SEED FPS COSMOS_DENOISE_STEPS NUM_OPEN_LOOP_STEPS CONTROL_FREQ ACTION_REPEAT
+    TASK_SUITE_NAME VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES ACTION_DIM ACTION_CHUNK CUDA_DEVICE SEED FPS COSMOS_DENOISE_STEPS NUM_OPEN_LOOP_STEPS CONTROL_FREQ ACTION_REPEAT
   do
     write_hparam "$key"
   done
 } > "$BASH_HPARAMS_FILE"
 
 cd "$LAST05_ROOT"
-source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
-export PATH=/root/miniconda3/envs/last05/bin:$PATH
+source /root/miniconda3/bin/activate /root/miniconda3/envs/last05_qwen3vl
+export PATH=/root/miniconda3/envs/last05_qwen3vl/bin:$PATH
 #export HF_HOME=/media/huggingFace
 export PYTHONPATH="${LAST05_ROOT}:${LIBERO_ROOT}:${COSMOS_ROOT}:${PYTHONPATH:-}"
 export WANDB_MODE=offline
@@ -172,6 +173,7 @@ python -u "$LAST05_ROOT/experiments/robot/libero/run_libero_eval_new.py" \
   --video_w "$VIDEO_W" \
   --video_frames "$VIDEO_FRAMES" \
   --num_cond_input_frames "$NUM_COND_INPUT_FRAMES" \
+  --action_dim "$ACTION_DIM" \
   --action_chunk "$ACTION_CHUNK" \
   --total_latent_tokens "$TOTAL_LATENT_TOKENS" \
   --img_latents_per_future "$IMG_LATENTS_PER_FUTURE" \

@@ -1,26 +1,27 @@
 #!/bin/bash
 set -e
 
-LAST05_ROOT="/mnt/nas/zhangyiming/last05_beta/last05_mot2_action"
+LAST05_ROOT="/mnt/nas/zhangyiming/last05_beta/last05_mot2_action_fis"
 
 cd "${LAST05_ROOT}/scripts"
-source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
+source /root/miniconda3/bin/activate /root/miniconda3/envs/last05_qwen3vl
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
-export PATH=/root/miniconda3/envs/last05/bin:$PATH
+export PATH=/root/miniconda3/envs/last05_qwen3vl/bin:$PATH
 export PYTHONPATH="${LAST05_ROOT}:${PYTHONPATH:-}"
-export PATH=/media/miniconda3/envs/last05.1/bin:$PATH
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_janus_mot2_libero_spatial}"
-RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
-OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_janus_mot2_fis_libero_spatial}"
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_fis_libero_spatial}"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_fis_spatial}"
 
 DATA_JSON="${DATA_JSON:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/train_with_atomic_action.json}"
 ACTION_EXPERT_PATH="${ACTION_EXPERT_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+JANUS_INIT_MODE="${JANUS_INIT_MODE:-janus_pro_ae_flow}"
+JANUS_PRO_MODEL_PATH="${JANUS_PRO_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B}"
 COSMOS_PT_PATH="${COSMOS_PT_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXP_NAME="${COSMOS_EXP_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 
@@ -70,8 +71,9 @@ WAN21_VAE_PATH="${WAN21_VAE_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-8}"
 BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
 
-echo ">>> Starting 2-MoT Libero training: ${RUN_NAME}"
+echo ">>> Starting FiS 2-MoT Libero training: ${RUN_NAME}"
 echo ">>> Spatial token mode: ${SPATIAL_TOKEN_MODE} count=${TOTAL_SPATIAL_TOKEN_COUNT}"
+echo ">>> Janus init mode: ${JANUS_INIT_MODE}"
 
 accelerate launch --config_file ../config/sft.yaml \
   --num_processes "${NUM_PROCESSES}" \
@@ -81,6 +83,8 @@ accelerate launch --config_file ../config/sft.yaml \
   --experiment_name "${EXPERIMENT_NAME}" \
   --run_name "${RUN_NAME}" \
   --action_expert_path "${ACTION_EXPERT_PATH}" \
+  --janus_init_mode "${JANUS_INIT_MODE}" \
+  --janus_pro_model_path "${JANUS_PRO_MODEL_PATH}" \
   --cosmos_model_path "${COSMOS_PT_PATH}" \
   --cosmos_experiment_name "${COSMOS_EXP_NAME}" \
   --cosmos_text_cache_path "${COSMOS_TEXT_CACHE_PATH}" \
