@@ -535,9 +535,7 @@ class VLACotDataset(Dataset):
         frame_idx = sample.get('frame_index', 0)
         video_tensor = self._load_video(sample['video_path'], frame_idx)
 
-        janus_primary_video_path = self._resolve_janus_primary_video_path(
-            sample.get('video_action_path', sample['video_path'])
-        )
+        janus_primary_video_path = self._resolve_janus_primary_video_path(sample['video_path'])
         first_frame_pil = self._load_frame_pil(janus_primary_video_path, frame_idx)
 
         janus_inputs = self.processor(

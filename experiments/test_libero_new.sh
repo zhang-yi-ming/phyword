@@ -2,20 +2,20 @@
 set -Eeuo pipefail
 
 
-LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_trex_action}"
 COSMOS_ROOT="/mnt/nas/zhangyiming/experiments"
 LIBERO_ROOT="/mnt/nas/zhangxuheng/LIBERO"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments}"
 
-RUN_NAME_FOR_LOG="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
+RUN_NAME_FOR_LOG="${RUN_NAME:-cosmos2B_trex2B_mot2_libero_spatial}"
 LOG_DIR="${EXPERIMENTS_ROOT}/shell"
 mkdir -p "$LOG_DIR"
 EVAL_TIMESTAMP="${EVAL_TIMESTAMP:-$(date +%Y_%m_%d-%H_%M_%S)}"
 SHELL_LOG="${SHELL_LOG:-$LOG_DIR/test_libero_shell_${EVAL_TIMESTAMP}_${RUN_NAME_FOR_LOG}.log}"
 
-OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial}"
-RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
-RUN_NAME_PREFIX="cosmos2B_action1B_mot2"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_trex_action_spatial}"
+RUN_NAME="${RUN_NAME:-cosmos2B_trex2B_mot2_libero_spatial}"
+RUN_NAME_PREFIX="cosmos2B_trex2B_mot2"
 EVAL_RUN_NAME="$RUN_NAME"
 if [[ "$EVAL_RUN_NAME" == "$RUN_NAME_PREFIX"* ]]; then
   EVAL_RUN_NAME="${EVAL_RUN_NAME#"$RUN_NAME_PREFIX"}"
@@ -64,8 +64,8 @@ else
     exit 1
   fi
 fi
-JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
-ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
+ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
 COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 
@@ -78,6 +78,7 @@ TOTAL_LATENT_TOKENS="${TOTAL_LATENT_TOKENS:-1}"
 FUTURE_FRAME_STRIDE=8
 ROBOT_STATE=0
 STATE_PLACEHOLDER_TOKENS=8
+STATE_DIM=8
 STATE_ENCODING_MODE="mlp"
 ACTION_INTERMEDIATE_SIZE=0
 ACTION_USE_LATENT_PREFIX="true"
@@ -89,8 +90,8 @@ ACTION_SELF_CAUSAL_IN_BRIDGE="true"
 TASK_SUITE_NAME="libero_spatial"
 VIDEO_H="${VIDEO_H:-256}"
 VIDEO_W="${VIDEO_W:-256}"
-VIDEO_FRAMES=1
-NUM_COND_INPUT_FRAMES=1
+VIDEO_FRAMES="${VIDEO_FRAMES:-17}"
+NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-5}"
 ACTION_CHUNK=16
 CUDA_DEVICE=0
 SEED=0
@@ -120,7 +121,7 @@ write_hparam() {
     REWRITE_EVAL_PROMPT USE_VALUE_PREDICTION USE_ACTION_VALUE_PREDICTION ACTION_VALUE_LOSS_WEIGHT VALUE_TOKEN_MASK_VIDEO_TO_VALUE VALUE_TOKEN_MASK_NONVALUE_TO_VALUE \
     USE_HISTORY_TRAJECTORY_JANUS_IMAGE HISTORY_TRAJECTORY_CAMERA_CONFIG_PATH \
     BRIDGE_POS_SCHEME IMG_LATENTS_PER_FUTURE STATE_LATENTS_PER_FUTURE NUM_FUTURE_FRAMES \
-    TOTAL_LATENT_TOKENS FUTURE_FRAME_STRIDE ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_ENCODING_MODE \
+    TOTAL_LATENT_TOKENS FUTURE_FRAME_STRIDE ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_DIM STATE_ENCODING_MODE \
     ACTION_INTERMEDIATE_SIZE ACTION_USE_LATENT_PREFIX DECOSMOS COSMOS_SELF_ONLY_BRIDGE ACTION_SELF_CAUSAL_IN_BRIDGE \
     TASK_SUITE_NAME VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES ACTION_CHUNK CUDA_DEVICE SEED FPS COSMOS_DENOISE_STEPS NUM_OPEN_LOOP_STEPS CONTROL_FREQ ACTION_REPEAT
   do
@@ -180,6 +181,7 @@ python -u "$LAST05_ROOT/experiments/robot/libero/run_libero_eval_new.py" \
   --future_frame_stride "$FUTURE_FRAME_STRIDE" \
   --robot_state "$ROBOT_STATE" \
   --state_placeholder_tokens "$STATE_PLACEHOLDER_TOKENS" \
+  --state_dim "$STATE_DIM" \
   --state_encoding_mode "$STATE_ENCODING_MODE" \
   --cuda "$CUDA_DEVICE" \
   --seed "$SEED" \

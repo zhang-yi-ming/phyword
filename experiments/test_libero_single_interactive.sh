@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_trex_action}"
 COSMOS_ROOT="${COSMOS_ROOT:-/mnt/nas/zhangyiming/experiments}"
 LIBERO_ROOT="${LIBERO_ROOT:-/mnt/nas/zhangxuheng/LIBERO}"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments_new}"
@@ -11,8 +11,8 @@ mkdir -p "$LOG_DIR"
 RUN_STAMP="${RUN_STAMP:-$(date +%Y_%m_%d-%H_%M_%S)-single-interactive}"
 SHELL_LOG="$LOG_DIR/test_libero_single_interactive_${RUN_STAMP}.log"
 
-OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial}"
-RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_libero_spatial}"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_trex_action_spatial}"
+RUN_NAME="${RUN_NAME:-cosmos2B_trex2B_mot2_libero_spatial}"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-}"
 RUN_DIR="${OUTPUT_ROOT_DIR}/${RUN_NAME}"
 if [[ -n "${PRETRAINED_CHECKPOINT:-}" ]]; then
@@ -23,8 +23,8 @@ else
   PRETRAINED_CHECKPOINT="$(find "$RUN_DIR" -maxdepth 1 -type d -name 'checkpoint-epoch-*-step-*' | sort -V | tail -n 1)"
 fi
 
-JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
-ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
+ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
 COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_raw_full_concat}"
@@ -45,6 +45,7 @@ TOTAL_LATENT_TOKENS="${TOTAL_LATENT_TOKENS:-1}"
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-8}"
 ROBOT_STATE="${ROBOT_STATE:-0}"
 STATE_PLACEHOLDER_TOKENS="${STATE_PLACEHOLDER_TOKENS:-8}"
+STATE_DIM="${STATE_DIM:-8}"
 STATE_ENCODING_MODE="${STATE_ENCODING_MODE:-mlp}"
 ACTION_INTERMEDIATE_SIZE="${ACTION_INTERMEDIATE_SIZE:-0}"
 ACTION_USE_LATENT_PREFIX="${ACTION_USE_LATENT_PREFIX:-true}"
@@ -56,8 +57,8 @@ TASK_SUITE_NAME="${TASK_SUITE_NAME:-libero_spatial}"
 INITIAL_STATES_PATH="${INITIAL_STATES_PATH:-DEFAULT}"
 VIDEO_H="${VIDEO_H:-256}"
 VIDEO_W="${VIDEO_W:-256}"
-VIDEO_FRAMES="${VIDEO_FRAMES:-1}"
-NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-1}"
+VIDEO_FRAMES="${VIDEO_FRAMES:-17}"
+NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-5}"
 ACTION_CHUNK="${ACTION_CHUNK:-16}"
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
 SEED="${SEED:-0}"
@@ -132,6 +133,7 @@ python -u "$LAST05_ROOT/experiments/robot/libero/run_libero_single_interactive.p
   --future_frame_stride "$FUTURE_FRAME_STRIDE" \
   --robot_state "$ROBOT_STATE" \
   --state_placeholder_tokens "$STATE_PLACEHOLDER_TOKENS" \
+  --state_dim "$STATE_DIM" \
   --state_encoding_mode "$STATE_ENCODING_MODE" \
   --cuda "$CUDA_DEVICE" \
   --seed "$SEED" \

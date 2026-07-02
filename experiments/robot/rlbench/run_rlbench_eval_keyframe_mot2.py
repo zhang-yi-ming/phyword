@@ -21,21 +21,21 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 from PIL import Image
 from scipy.spatial.transform import Rotation as R  # noqa: F401 - imported for lift3d compatibility in some envs
-from transformers import AutoModelForCausalLM
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 project_root_str = str(PROJECT_ROOT)
 if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
-from janus.models import ActionTokenizer, VLChatProcessor
 from models.cosmos_janus_action_spatial import (
     CosmosJanusActionSpatialMoT2Expert,
     normalize_bridge_pos_scheme,
 )
 from models.cosmos_janus_cot import build_token_sequence_mask
+from models.trex_action_backend import TrexActionModel, resolve_trex_checkpoint_path
 from cosmos_predict2._src.predict2.utils.model_loader import load_model_from_checkpoint
 from utils.cosmos_text_cache import CosmosQwenTextEmbedder, CosmosTextEmbeddingCache
+from utils.trex_processor import load_trex_processor
 
 from lift3d.envs.rlbench_env import RLBenchActionMode, RLBenchEnv, RLBenchObservationConfig
 from lift3d.helpers.gymnasium import VideoWrapper
@@ -71,6 +71,23 @@ JANUS_ACTION_PROMPT_SUFFIX = (
     "Please refer to the current image and task instruction, predict the spatial token "
     "and output the action to execute now."
 )
+
+
+def build_qwen_chat_prompt(processor, user_text: str) -> str:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": user_text},
+            ],
+        }
+    ]
+    return processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 
 @dataclass
@@ -248,15 +265,22 @@ def load_processor_for_checkpoint(model_path: str, checkpoint_dir: str):
     candidate_paths = []
     if checkpoint_dir and checkpoint_dir not in candidate_paths:
         candidate_paths.append(checkpoint_dir)
-    if model_path and model_path not in candidate_paths:
-        candidate_paths.append(model_path)
+    if model_path:
+        try:
+            trex_ckpt = resolve_trex_checkpoint_path(model_path)
+            processor_dir = os.path.join(trex_ckpt, "processor")
+            if processor_dir not in candidate_paths:
+                candidate_paths.append(processor_dir)
+        except Exception:
+            if model_path not in candidate_paths:
+                candidate_paths.append(model_path)
 
     last_error = None
     for candidate in candidate_paths:
         try:
-            processor = VLChatProcessor.from_pretrained(candidate, trust_remote_code=True)
+            processor = load_trex_processor(candidate)
             if candidate != model_path:
-                logger.info("Loaded VLChatProcessor from %s", candidate)
+                logger.info("Loaded Qwen/T-Rex processor from %s", candidate)
             return processor
         except Exception as exc:
             last_error = exc
@@ -273,6 +297,7 @@ def infer_checkpoint_vocab_size(state_dict: dict[str, Any]) -> Optional[int]:
     vocab_keys = [
         "janus.language_model.model.embed_tokens.weight",
         "janus.language_model.lm_head.weight",
+        "janus.vla.model.embed_tokens.weight",
     ]
     sizes = []
     for key in vocab_keys:
@@ -320,8 +345,6 @@ def ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size: 
     language_model.resize_token_embeddings(target_vocab)
     if hasattr(janus_model.config, "vocab_size"):
         janus_model.config.vocab_size = target_vocab
-    if hasattr(janus_model.config, "language_config"):
-        janus_model.config.language_config.vocab_size = target_vocab
     if hasattr(language_model, "config"):
         language_model.config.vocab_size = target_vocab
 
@@ -331,6 +354,7 @@ def validate_checkpoint_vocab_size(state_dict: dict[str, Any], tokenizer) -> Non
     vocab_keys = [
         "janus.language_model.model.embed_tokens.weight",
         "janus.language_model.lm_head.weight",
+        "janus.vla.model.embed_tokens.weight",
     ]
     mismatches = []
     checkpoint_vocab_sizes = []
@@ -369,18 +393,19 @@ def model_load(cfg: EvalConfig):
     ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
     processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
     tokenizer = processor.tokenizer
-    action_tokenizer = ActionTokenizer(tokenizer, need_to_sub=3)
-    cfg.janus_image_start_id = getattr(processor, "image_start_id", None) or tokenizer.convert_tokens_to_ids("<begin_of_image>")
-    cfg.janus_image_end_id = getattr(processor, "image_end_id", None) or tokenizer.convert_tokens_to_ids("<end_of_image>")
-    cfg.latent_end_id = tokenizer.convert_tokens_to_ids("<|latent_end|>")
+    action_tokenizer = None
+    cfg.janus_image_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    cfg.janus_image_end_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    cfg.latent_end_id = tokenizer.eos_token_id
+    cfg.trex_image_token_id = int(tokenizer.convert_tokens_to_ids("<|image_pad|>"))
 
-    janus_model = AutoModelForCausalLM.from_pretrained(
+    janus_model, _ = TrexActionModel.from_checkpoint(
         cfg.action_model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        flow=True,
         action_dim=cfg.action_dim,
-        ignore_mismatched_sizes=True,
+        action_chunk=cfg.action_chunk,
+        torch_dtype=torch.bfloat16,
+        use_robot_state=bool(cfg.robot_state),
+        verbose=True,
     )
 
     import cosmos_predict2._src.predict2.models.text2world_model_rectified_flow as t2w_module
@@ -467,10 +492,9 @@ def build_eval_state_inputs(cfg, processor, action_tokenizer, statistic, current
             raise ValueError(f"Expected state_dim={cfg.state_dim}, got {norm_state.shape}.")
         now_state = torch.tensor(norm_state, dtype=torch.float32)
     else:
-        current_state_ids = torch.LongTensor(processor.tokenizer.encode(action_tokenizer(norm_state), add_special_tokens=False))
-        now_state = current_state_ids
+        raise ValueError("T-Rex action eval supports state_encoding_mode='mlp' only.")
     placeholder_count = int(cfg.state_placeholder_tokens)
-    placeholder_text = resolve_pad_token_text(processor) * placeholder_count
+    placeholder_text = " ".join([resolve_pad_token_text(processor)] * placeholder_count)
     placeholder_ids = torch.full((placeholder_count,), resolve_pad_token_id(processor), dtype=torch.long)
     return placeholder_text, placeholder_ids, now_state
 
@@ -554,26 +578,18 @@ def predict_actions(cfg, model, processor, action_tokenizer, statistic, prompt, 
     if now_state is not None:
         now_state = now_state.unsqueeze(0).to(device)
 
-    user_content = f"<image_placeholder>\n{prompt}\n{JANUS_ACTION_PROMPT_SUFFIX}{state_tokens}"
-    user_prompt = processor.apply_sft_template_for_multi_turn_prompts(
-        conversations=[{"role": "<|User|>", "content": user_content}],
-        sft_format=processor.sft_format,
-        system_prompt="",
-    )
-    prompt_text = user_prompt + "\n\n<|Assistant|>:"
-    janus_inputs = processor(prompt=prompt_text, images=[image], return_tensors="pt")
+    user_content = f"{prompt}\n{JANUS_ACTION_PROMPT_SUFFIX}"
+    if state_tokens:
+        user_content += "\n" + state_tokens
+    prompt_text = build_qwen_chat_prompt(processor, user_content)
+    janus_inputs = processor(text=prompt_text, images=[image], return_tensors="pt", padding=False)
     janus_input_ids = janus_inputs.input_ids.to(device)
 
-    cosmos_user_content = f"<image_placeholder>\n{prompt}"
+    cosmos_user_content = f"{prompt}"
     if state_tokens:
-        cosmos_user_content += state_tokens
-    cosmos_user_prompt = processor.apply_sft_template_for_multi_turn_prompts(
-        conversations=[{"role": "<|User|>", "content": cosmos_user_content}],
-        sft_format=processor.sft_format,
-        system_prompt="",
-    )
-    cosmos_prompt_text = cosmos_user_prompt + "\n\n<|Assistant|>:"
-    cosmos_janus_inputs = processor(prompt=cosmos_prompt_text, images=[image], return_tensors="pt")
+        cosmos_user_content += "\n" + state_tokens
+    cosmos_prompt_text = build_qwen_chat_prompt(processor, cosmos_user_content)
+    cosmos_janus_inputs = processor(text=cosmos_prompt_text, images=[image], return_tensors="pt", padding=False)
     cosmos_janus_input_ids = cosmos_janus_inputs.input_ids.to(device)
 
     janus_state_seq_mask = build_token_sequence_mask(
@@ -591,6 +607,9 @@ def predict_actions(cfg, model, processor, action_tokenizer, statistic, prompt, 
     pad_token_id = resolve_pad_token_id(processor)
     janus_left_pad_lens = janus_input_ids.eq(pad_token_id).to(torch.long).cumprod(dim=1).sum(dim=1)
     attention_mask = janus_inputs.attention_mask.to(device).to(torch.bool)
+    image_token_id = int(getattr(cfg, "trex_image_token_id", processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")))
+    janus_image_mask = janus_input_ids.eq(image_token_id)
+    cosmos_janus_image_mask = cosmos_janus_input_ids.eq(image_token_id)
     cosmos_text_embeddings = None
     if cfg.cosmos_text_cache_path:
         cache = getattr(model, "cosmos_text_cache")
@@ -601,8 +620,9 @@ def predict_actions(cfg, model, processor, action_tokenizer, statistic, prompt, 
         inference_outputs = model.forward_flow_joint_inference(
             janus_input_ids=janus_input_ids,
             janus_pixel_values=janus_inputs.pixel_values.to(device).to(dtype),
-            janus_images_seq_mask=janus_inputs.images_seq_mask.to(device),
-            janus_images_emb_mask=janus_inputs.images_emb_mask.to(device),
+            janus_image_grid_thw=janus_inputs.image_grid_thw.to(device),
+            janus_images_seq_mask=janus_image_mask,
+            janus_images_emb_mask=janus_image_mask,
             first_frame=build_cosmos_frames(obs_history, None, device, dtype),
             action_denoise_steps=cfg.action_denoise_steps,
             cosmos_denoise_steps=cfg.cosmos_denoise_steps,
@@ -612,9 +632,10 @@ def predict_actions(cfg, model, processor, action_tokenizer, statistic, prompt, 
             janus_state_seq_mask=janus_state_seq_mask,
             janus_attention_mask=attention_mask,
             cosmos_janus_input_ids=cosmos_janus_input_ids,
-            cosmos_janus_images_seq_mask=cosmos_janus_inputs.images_seq_mask.to(device),
+            cosmos_janus_image_grid_thw=cosmos_janus_inputs.image_grid_thw.to(device),
+            cosmos_janus_images_seq_mask=cosmos_janus_image_mask,
             cosmos_janus_state_seq_mask=cosmos_janus_state_seq_mask,
-            cosmos_janus_images_emb_mask=cosmos_janus_inputs.images_emb_mask.to(device),
+            cosmos_janus_images_emb_mask=cosmos_janus_image_mask,
             now_state=now_state,
             cosmos_text_embeddings=cosmos_text_embeddings,
         )

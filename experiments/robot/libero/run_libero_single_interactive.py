@@ -46,6 +46,7 @@ from experiments.robot.libero.run_libero_eval_new import (  # noqa: E402
     JANUS_ACTION_PROMPT_SUFFIX,
     GenerateConfig,
     TASK_MAX_STEPS,
+    build_qwen_chat_prompt,
     build_token_sequence_mask,
     build_eval_state_inputs,
     coerce_bool,
@@ -564,16 +565,10 @@ class SingleLiberoInteractiveRunner:
         if now_state is not None:
             now_state = now_state.unsqueeze(0).to(device)
 
-        user_content = (
-            f"<image_placeholder>\n{eval_prompt}\n"
-            f"{JANUS_ACTION_PROMPT_SUFFIX}{state_tokens_str}"
-        )
-        user_prompt = self.processor.apply_sft_template_for_multi_turn_prompts(
-            conversations=[{"role": "<|User|>", "content": user_content}],
-            sft_format=self.processor.sft_format,
-            system_prompt="",
-        )
-        prompt_text = user_prompt + "\n\n<|Assistant|>:"
+        user_content = f"{eval_prompt}\n{JANUS_ACTION_PROMPT_SUFFIX}"
+        if state_tokens_str:
+            user_content += "\n" + state_tokens_str
+        prompt_text = build_qwen_chat_prompt(self.processor, user_content)
         janus_primary_image = primary_image
         if self.trajectory_camera_config is not None:
             janus_primary_image = draw_history_trajectory_on_image(
@@ -581,21 +576,30 @@ class SingleLiberoInteractiveRunner:
                 [] if ee_history is None else ee_history,
                 self.trajectory_camera_config,
             )
-        janus_inputs = self.processor(prompt=prompt_text, images=[janus_primary_image], return_tensors="pt")
-        cosmos_user_content = f"<image_placeholder>\n{eval_prompt}"
-        if state_tokens_str:
-            cosmos_user_content += f"\n{state_tokens_str}"
-        cosmos_user_prompt = self.processor.apply_sft_template_for_multi_turn_prompts(
-            conversations=[{"role": "<|User|>", "content": cosmos_user_content}],
-            sft_format=self.processor.sft_format,
-            system_prompt="",
+        janus_inputs = self.processor(
+            text=prompt_text,
+            images=[janus_primary_image],
+            return_tensors="pt",
+            padding=False,
         )
-        cosmos_prompt_text = cosmos_user_prompt + "\n\n<|Assistant|>:"
-        cosmos_janus_inputs = self.processor(prompt=cosmos_prompt_text, images=[janus_primary_image], return_tensors="pt")
+        cosmos_user_content = f"{eval_prompt}"
+        if state_tokens_str:
+            cosmos_user_content += "\n" + state_tokens_str
+        cosmos_prompt_text = build_qwen_chat_prompt(self.processor, cosmos_user_content)
+        cosmos_janus_inputs = self.processor(
+            text=cosmos_prompt_text,
+            images=[janus_primary_image],
+            return_tensors="pt",
+            padding=False,
+        )
 
         janus_input_ids = janus_inputs.input_ids.to(device)
         janus_pixel_values = janus_inputs.pixel_values.to(device).to(dtype)
-        janus_images_seq_mask = janus_inputs.images_seq_mask.to(device)
+        janus_image_grid_thw = janus_inputs.image_grid_thw.to(device)
+        image_token_id = int(
+            getattr(cfg, "trex_image_token_id", self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
+        )
+        janus_images_seq_mask = janus_input_ids.eq(image_token_id)
         janus_state_seq_mask = torch.zeros_like(janus_input_ids, dtype=torch.bool, device=device)
         if state_placeholder_ids is not None:
             janus_state_seq_mask = build_token_sequence_mask(
@@ -604,7 +608,7 @@ class SingleLiberoInteractiveRunner:
                 require_match=bool(int(getattr(cfg, "robot_state", 0) or 0)),
                 name="current state placeholder",
             ).to(device)
-        janus_images_emb_mask = janus_inputs.images_emb_mask.to(device)
+        janus_images_emb_mask = janus_images_seq_mask
         if getattr(janus_inputs, "attention_mask", None) is None:
             janus_attention_mask = torch.ones_like(janus_input_ids, dtype=torch.bool, device=device)
         else:
@@ -612,6 +616,8 @@ class SingleLiberoInteractiveRunner:
         pad_token_id = resolve_pad_token_id(self.processor)
         janus_left_pad_lens = janus_input_ids.eq(pad_token_id).to(torch.long).cumprod(dim=1).sum(dim=1)
         cosmos_janus_input_ids = cosmos_janus_inputs.input_ids.to(device)
+        cosmos_janus_image_grid_thw = cosmos_janus_inputs.image_grid_thw.to(device)
+        cosmos_janus_images_seq_mask = cosmos_janus_input_ids.eq(image_token_id)
         cosmos_janus_state_seq_mask = build_token_sequence_mask(
             cosmos_janus_input_ids,
             state_placeholder_ids,
@@ -626,6 +632,7 @@ class SingleLiberoInteractiveRunner:
             inference_outputs = self.model.forward_flow_joint_inference(
                 janus_input_ids=janus_input_ids,
                 janus_pixel_values=janus_pixel_values,
+                janus_image_grid_thw=janus_image_grid_thw,
                 janus_images_seq_mask=janus_images_seq_mask,
                 janus_images_emb_mask=janus_images_emb_mask,
                 first_frame=first_frame_tensor,
@@ -640,9 +647,10 @@ class SingleLiberoInteractiveRunner:
                 now_state=now_state,
                 cosmos_text_embeddings=cosmos_text_embeddings,
                 cosmos_janus_input_ids=cosmos_janus_input_ids,
-                cosmos_janus_images_seq_mask=cosmos_janus_inputs.images_seq_mask.to(device),
+                cosmos_janus_image_grid_thw=cosmos_janus_image_grid_thw,
+                cosmos_janus_images_seq_mask=cosmos_janus_images_seq_mask,
                 cosmos_janus_state_seq_mask=cosmos_janus_state_seq_mask,
-                cosmos_janus_images_emb_mask=cosmos_janus_inputs.images_emb_mask.to(device),
+                cosmos_janus_images_emb_mask=cosmos_janus_images_seq_mask,
             )
 
         predicted_value = None
@@ -1263,6 +1271,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--action_chunk", type=int, default=16)
     parser.add_argument("--robot_state", type=int, default=0)
     parser.add_argument("--state_placeholder_tokens", type=int, default=8)
+    parser.add_argument("--state_dim", type=int, default=8)
     parser.add_argument("--state_encoding_mode", default="mlp")
     parser.add_argument("--action_intermediate_size", type=int, default=0)
     parser.add_argument("--total_latent_tokens", type=int, default=1)

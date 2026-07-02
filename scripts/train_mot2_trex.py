@@ -1,10 +1,10 @@
 """
-RLBench keyframe training entry for the 2-MoT Cosmos + Janus-action architecture.
+Libero training entry for the 2-MoT Cosmos + Janus-action architecture.
 
-The old middle latent expert is removed. v/n/vn spatial labels from the keyframe
-JSON are inserted into the Janus action sequence and supervised with next-token
-CE, while the final action tokens are supervised with flow matching. Janus is
-loaded only from --action_expert_path.
+The old middle latent expert is removed. Spatial labels from the dataset are
+inserted into the Janus action sequence and supervised with next-token CE, while
+the final action tokens are supervised with flow matching. Janus is loaded only
+from --action_expert_path.
 """
 
 import os
@@ -20,7 +20,6 @@ import re
 import wandb
 import numpy as np
 import gc
-from contextlib import contextmanager
 from typing import List, Dict
 
 import torch.nn.functional as F
@@ -30,7 +29,6 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from accelerate import Accelerator
 from transformers import set_seed
-from transformers.utils import logging as transformers_logging
 from PIL import Image
 
 # Make imports resolve to this checkout even when launched from scripts/ with
@@ -40,6 +38,7 @@ if PROJECT_ROOT in sys.path:
     sys.path.remove(PROJECT_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
+from decord import VideoReader, cpu
 import torchvision.transforms as transforms
 
 import models.cosmos_janus_action_spatial as cosmos_janus_mot2_module
@@ -62,16 +61,6 @@ LATENT_TOKEN_MODE_ALIASES = {
     "1": "v",
     "2": "vn",
 }
-
-JANUS_ACTION_PROMPT_SUFFIX = (
-    "Please refer to the current image and task instruction, predict the spatial token "
-    "and output the action to execute now."
-)
-
-DEFAULT_TREX_PROCESSOR_PATH = (
-    "/mnt/nas/zhangyiming/database/ckpt/pretrained/"
-    "T-Rex_pretrain_mecka22k_epoch1/checkpoint-0-610000/processor"
-)
 
 
 def normalize_latent_token_mode(value: str) -> str:
@@ -116,72 +105,51 @@ def resolve_latent_token_args(args):
     args.total_latent_tokens = len(fields)
     return args
 
+JANUS_ACTION_PROMPT_SUFFIX = (
+    "Please refer to the current image and task instruction, predict the spatial token "
+    "and output the action to execute now."
+)
 
-def parse_front_pic_index(path):
-    match = re.search(r"front_(\d+)\.[^.]+$", os.path.basename(str(path)))
-    if match is None:
-        raise ValueError(f"Could not parse RLBench front image index from path: {path}")
-    return int(match.group(1))
-
-
-def build_front_pic_path(current_path, idx):
-    dirname = os.path.dirname(str(current_path))
-    basename = os.path.basename(str(current_path))
-    next_basename = re.sub(r"front_\d+(\.[^.]+)$", f"front_{int(idx)}\\1", basename)
-    if next_basename == basename and parse_front_pic_index(current_path) != int(idx):
-        raise ValueError(f"Could not replace RLBench front image index in path: {current_path}")
-    return os.path.join(dirname, next_basename)
+DEFAULT_TREX_PROCESSOR_PATH = (
+    "/mnt/nas/zhangyiming/database/ckpt/pretrained/"
+    "T-Rex_pretrain_mecka22k_epoch1/checkpoint-0-610000/processor"
+)
 
 
-def clipped_keyframe_indices(cur, pic_num, video_frames, num_cond_input_frames):
-    cur = int(cur)
-    pic_num = int(pic_num)
-    video_frames = int(video_frames)
-    num_cond_input_frames = int(num_cond_input_frames)
-    if video_frames <= 0:
-        raise ValueError(f"video_frames must be positive, got {video_frames}.")
-    if num_cond_input_frames <= 0:
-        raise ValueError(f"num_cond_input_frames must be positive, got {num_cond_input_frames}.")
-    start = cur - (num_cond_input_frames - 1)
-    indices = np.arange(start, start + video_frames)
-    return np.clip(indices, 0, pic_num).astype(int)
+def build_janus_action_prompt_suffix(use_history_trajectory: bool) -> str:
+    return JANUS_ACTION_PROMPT_SUFFIX
 
 
-def resolve_rlbench_episode_key(sample):
-    if "task_name" in sample:
-        task = str(sample["task_name"])
-    else:
-        front_pic = str(sample["front_pic"])
-        episode_dir = os.path.dirname(front_pic)
-        task_dir = os.path.dirname(episode_dir)
-        task = os.path.basename(task_dir) or os.path.basename(episode_dir)
-    return task, int(sample["episode_index"])
+def add_extra_special_tokens_to_tokenizer(tokenizer, extra_special_tokens: str):
+    tokens = []
+    for raw in re.split(r"[,\s]+", str(extra_special_tokens or "")):
+        token = raw.strip()
+        if token:
+            tokens.append(token)
+    if not tokens:
+        return 0
+    existing = set(tokenizer.get_vocab().keys())
+    to_add = [token for token in tokens if token not in existing]
+    if not to_add:
+        return 0
+    return tokenizer.add_special_tokens({"additional_special_tokens": to_add})
 
 
-@contextmanager
-def suppress_transformers_loading_warnings():
-    """Temporarily silence Transformers weight-loading warnings."""
-    previous_verbosity = transformers_logging.get_verbosity()
-    try:
-        transformers_logging.set_verbosity_error()
-        yield
-    finally:
-        transformers_logging.set_verbosity(previous_verbosity)
-
-
-def extract_unloaded_keys(loading_info: Dict) -> List[str]:
-    unloaded_keys: List[str] = []
-
-    unloaded_keys.extend(loading_info.get("missing_keys", []) or [])
-    unloaded_keys.extend(loading_info.get("unexpected_keys", []) or [])
-
-    for item in loading_info.get("mismatched_keys", []) or []:
-        if isinstance(item, (list, tuple)) and item:
-            unloaded_keys.append(item[0])
-        else:
-            unloaded_keys.append(str(item))
-
-    return unloaded_keys
+def build_qwen_chat_prompt(processor, user_text: str) -> str:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": user_text},
+            ],
+        }
+    ]
+    return processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 
 def move_batch_to_device(batch: Dict, device: torch.device) -> Dict:
@@ -248,38 +216,6 @@ def resolve_video_condition_args(args, video_tokenizer=None):
     return args
 
 
-def add_extra_special_tokens_to_tokenizer(tokenizer, extra_special_tokens: str):
-    tokens = []
-    for raw in re.split(r"[,\s]+", str(extra_special_tokens or "")):
-        token = raw.strip()
-        if token:
-            tokens.append(token)
-    if not tokens:
-        return 0
-    existing = set(tokenizer.get_vocab().keys())
-    to_add = [token for token in tokens if token not in existing]
-    if not to_add:
-        return 0
-    return tokenizer.add_special_tokens({"additional_special_tokens": to_add})
-
-
-def build_qwen_chat_prompt(processor, user_text: str) -> str:
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": user_text},
-            ],
-        }
-    ]
-    return processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-
 def get_custom_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.0, num_cycles=0.5):
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
@@ -312,12 +248,12 @@ class VLACotDataset(Dataset):
                 f"Using cached Cosmos text embeddings from {self.cosmos_text_cache.root}"
             )
 
-        self.accelerator.print(f"Loading RLBench keyframe dataset from {config.data_path} ...")
-        with open(config.data_path, 'r', encoding='utf-8') as f:
+        self.accelerator.print(f"Loading dataset from {config.data_path} ...")
+        with open(config.data_path, 'r') as f:
             self.data = json.load(f)
 
-        statistics_path = config.data_path.replace(".json", "_statistics.json")
-        with open(statistics_path, 'r', encoding='utf-8') as f:
+        statistics_path = os.path.join(os.path.dirname(config.data_path), "train_statistics.json")
+        with open(statistics_path, 'r') as f:
             self.stats_data = json.load(f)
 
         self.dataset_name = next(iter(self.stats_data))
@@ -344,17 +280,23 @@ class VLACotDataset(Dataset):
         else:
             self.latent_hidden_sim_transform = None
 
-        # Build episode index for diagnostics and optional future lookups.
+        # Build episode index for future frame lookup
         self._build_episode_index()
 
     def _build_episode_index(self):
-        """Group samples by RLBench task/episode."""
-        self.episode_records = {}
+        """Group samples by video_path so we can look up future frames."""
+        self.episodes = {}
         for i, sample in enumerate(self.data):
-            key = resolve_rlbench_episode_key(sample)
-            record_index = int(sample["record_index"])
-            self.episode_records.setdefault(key, {})[record_index] = i
-        self.accelerator.print(f"Indexed {len(self.episode_records)} RLBench task/episode groups.")
+            vid = sample['video_path']
+            if vid not in self.episodes:
+                self.episodes[vid] = []
+            self.episodes[vid].append((i, sample.get('frame_index', 0)))
+
+        # Sort each episode by frame_index
+        self.episode_frame_indices = {}
+        for vid in self.episodes:
+            self.episodes[vid].sort(key=lambda x: x[1])
+            self.episode_frame_indices[vid] = [frame_idx for _, frame_idx in self.episodes[vid]]
 
     def __len__(self):
         return len(self.data)
@@ -371,6 +313,13 @@ class VLACotDataset(Dataset):
             return os.path.join(self.config.data_root, path)
         return path
 
+    def _resolve_janus_primary_video_path(self, video_path):
+        if not int(getattr(self.config, 'use_history_trajectory_janus_image', 0) or 0):
+            return video_path
+
+        stem, ext = os.path.splitext(video_path)
+        return f"{stem}_history_trajectory{ext}"
+
     def _resolve_pad_token_id(self):
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None and hasattr(self.processor, 'pad_id'):
@@ -383,6 +332,8 @@ class VLACotDataset(Dataset):
         candidates = []
         if self.tokenizer.pad_token is not None:
             candidates.append(self.tokenizer.pad_token)
+        if hasattr(self.processor, 'pad_tag'):
+            candidates.append(self.processor.pad_tag)
 
         token_text = self.tokenizer.convert_ids_to_tokens(self.pad_token_id)
         if token_text is not None:
@@ -425,45 +376,50 @@ class VLACotDataset(Dataset):
     def _normalize_state(self, state):
         state_arr = np.array(state, dtype=np.float32)
         norm_state = self._normalize(state_arr, self.state_q01, self.state_q99, self.state_mask)
-        expected_dim = int(getattr(self.config, "state_dim", 7))
+        expected_dim = int(getattr(self.config, "state_dim", 8))
         if self._state_encoding_mode() == 'mlp' and norm_state.shape[-1] != expected_dim:
             raise ValueError(f"MLP state encoding expects state dim {expected_dim}, got shape {norm_state.shape}.")
         return norm_state
 
-    def _load_image_pil(self, image_path):
-        image_path_abs = self._resolve_data_path(image_path)
-        return Image.open(image_path_abs).convert("RGB")
+    def _load_frame_pil(self, video_path, frame_idx):
+        video_path_abs = self._resolve_data_path(video_path)
+        vr = VideoReader(video_path_abs, ctx=cpu(0))
+        frame_np = vr.get_batch([frame_idx]).asnumpy()[0]
+        return Image.fromarray(frame_np.astype(np.uint8))
 
-    def _load_future_frame_pil(self, sample, stride):
-        stride = int(stride)
-        if stride <= 0:
-            raise ValueError("future_frame_stride must be positive when use_latent_hidden_sim_loss=1.")
-        cur = parse_front_pic_index(sample["front_pic"])
-        pic_num = int(sample["pic_num"])
-        target_idx = int(np.clip(cur + stride, 0, pic_num))
-        frame_path = build_front_pic_path(self._resolve_data_path(sample["front_pic"]), target_idx)
-        return self._load_image_pil(frame_path)
+    def _load_future_frame_pil(self, video_path, frame_idx, stride):
+        video_path_abs = self._resolve_data_path(video_path)
+        vr = VideoReader(video_path_abs, ctx=cpu(0))
+        total_frames = len(vr)
+        if total_frames <= 0:
+            raise ValueError(f"Video has no frames: {video_path_abs}")
+        target_idx = min(int(frame_idx) + int(stride), total_frames - 1)
+        frame_np = vr.get_batch([target_idx]).asnumpy()[0]
+        return Image.fromarray(frame_np.astype(np.uint8))
 
-    def _load_video(self, sample):
-        target_frames = int(self.config.video_frames)
+    def _load_video(self, video_path, frame_idx):
+        target_frames = self.config.video_frames
         num_cond_input_frames = int(getattr(self.config, "num_cond_input_frames", 1))
-        cur = parse_front_pic_index(sample["front_pic"])
-        pic_num = int(sample["pic_num"])
-        indices = clipped_keyframe_indices(cur, pic_num, target_frames, num_cond_input_frames)
-        frames = []
-        for idx in indices:
-            frame_path = build_front_pic_path(self._resolve_data_path(sample["front_pic"]), idx)
-            frames.append(np.array(self._load_image_pil(frame_path), dtype=np.uint8))
-        frames = np.stack(frames, axis=0)
+        start_frame = int(frame_idx) - (num_cond_input_frames - 1)
+        video_path = self._resolve_data_path(video_path)
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total_frames = len(vr)
+        indices = np.arange(start_frame, start_frame + target_frames)
+        indices = np.clip(indices, 0, total_frames - 1)
+        frames = vr.get_batch(indices).asnumpy()
         frames_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0
         frames_tensor = self.video_transform(frames_tensor)
         frames_tensor = frames_tensor.permute(1, 0, 2, 3)
         return frames_tensor
 
-    def _compute_value_target(self, sample):
-        record_count = int(sample.get("record_count", 1))
-        record_index = int(sample.get("record_index", 0))
-        alpha = max(record_count - record_index, 1)
+    def _compute_value_target(self, video_path, frame_idx):
+        video_path_abs = self._resolve_data_path(video_path)
+        vr = VideoReader(video_path_abs, ctx=cpu(0))
+        total_frames = len(vr)
+        if total_frames <= 0:
+            raise ValueError(f"Video has no frames: {video_path_abs}")
+        current_frame = int(frame_idx) % total_frames
+        alpha = total_frames - current_frame
         value = 0.99 ** alpha
         return torch.tensor(value, dtype=torch.float32)
 
@@ -551,14 +507,21 @@ class VLACotDataset(Dataset):
             state_tokens_str = self._build_state_placeholder_text()
             state_placeholder_ids = self._build_state_placeholder_ids()
 
-        user_content = f"{sample['input_prompt']}\n{JANUS_ACTION_PROMPT_SUFFIX}"
+        action_prompt_suffix = build_janus_action_prompt_suffix(
+            bool(getattr(self.config, 'use_history_trajectory_janus_image', 0))
+        )
+        user_content = f"{sample['input_prompt']}"
+        if action_prompt_suffix:
+            user_content += "\n" + action_prompt_suffix
         if state_tokens_str:
             user_content += "\n" + state_tokens_str
         prompt = build_qwen_chat_prompt(self.processor, user_content)
 
-        video_tensor = self._load_video(sample)
+        frame_idx = sample.get('frame_index', 0)
+        video_tensor = self._load_video(sample['video_path'], frame_idx)
 
-        first_frame_pil = self._load_image_pil(sample['front_pic'])
+        janus_primary_video_path = self._resolve_janus_primary_video_path(sample['video_path'])
+        first_frame_pil = self._load_frame_pil(janus_primary_video_path, frame_idx)
 
         janus_inputs = self.processor(
             text=prompt,
@@ -608,7 +571,8 @@ class VLACotDataset(Dataset):
         latent_hidden_sim_image_grid_thw = None
         if int(getattr(self.config, "use_latent_hidden_sim_loss", 0) or 0):
             future_frame_pil = self._load_future_frame_pil(
-                sample,
+                sample['video_path'],
+                frame_idx,
                 self.config.future_frame_stride,
             )
             if self.latent_hidden_sim_loss_mode == "wan_vae":
@@ -781,11 +745,13 @@ def ensure_janus_tokenizer_alignment(janus_model, tokenizer, accelerator=None):
     if accelerator is not None:
         accelerator.print(
             f"Resizing Janus token embeddings/lm_head from {current_vocab} to {target_vocab} "
-            "for RLBench token-latent special tokens."
+            "for token-latent special tokens."
         )
     language_model.resize_token_embeddings(target_vocab)
     if hasattr(janus_model.config, "vocab_size"):
         janus_model.config.vocab_size = target_vocab
+    if hasattr(janus_model.config, "language_config"):
+        janus_model.config.language_config.vocab_size = target_vocab
     if hasattr(language_model, "config"):
         language_model.config.vocab_size = target_vocab
 
@@ -800,6 +766,7 @@ def initialize_action_special_token_rows(janus_model, tokenizer, accelerator=Non
         "</PULL>": ("pull",),
         "</PUSH>": ("push",),
         "</NONE>": ("none",),
+        "</MOVE><PICK>": ("move", "pick"),
     }
 
     def derive_source_words(token_text: str):
@@ -945,8 +912,8 @@ def train(args):
     accelerator.print(f"added_extra_special_tokens={added_extra_special_tokens}")
 
     # ----------------------------------------------------------------
-    # Load the T-Rex action expert. Shape-mismatched 62D pretraining action
-    # heads are skipped and reinitialized for the requested action_dim.
+    # Load T-Rex. Shape-mismatched 62D pretraining action heads are skipped and
+    # reinitialized for the requested action_dim/action_chunk.
     # ----------------------------------------------------------------
     accelerator.print("Loading T-Rex action expert checkpoint...")
     janus_model, trex_loading_info = TrexActionModel.from_checkpoint(
@@ -984,7 +951,7 @@ def train(args):
     # ----------------------------------------------------------------
     # Build Cosmos + action MoT
     # ----------------------------------------------------------------
-    accelerator.print("Building 2-MoT Cosmos-Janus action-spatial VLA...")
+    accelerator.print("Building 2-MoT Cosmos-T-Rex action-spatial VLA...")
     args.janus_image_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
     args.janus_image_end_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
     args.latent_end_id = processor.tokenizer.eos_token_id
@@ -1069,9 +1036,9 @@ def train(args):
         accelerator.print(f"lm_head aligned = {len(tokenizer) == lm_head.weight.shape[0]}")
 
     for tok in [
-        "<image_placeholder>",
-        "<begin_of_image>",
-        "<end_of_image>",
+        "<|vision_start|>",
+        "<|image_pad|>",
+        "<|vision_end|>",
         "<|latent_pad|>",
         "<|latent_end|>",
         "</MOVE>",
@@ -1081,6 +1048,7 @@ def train(args):
         "</PULL>",
         "</PUSH>",
         "</NONE>",
+        "</MOVE><PICK>",
     ]:
         accelerator.print(f"{tok:<22} -> {tokenizer.convert_tokens_to_ids(tok)}")
 
@@ -1277,11 +1245,10 @@ def train(args):
                         janus_images_emb_mask=janus_images_emb_mask,
                         janus_attention_mask=attention_mask,
                         cosmos_janus_input_ids=cosmos_janus_input_ids,
-                        janus_action_pixel_values=None,
+                        cosmos_janus_image_grid_thw=cosmos_janus_image_grid_thw,
                         cosmos_janus_images_seq_mask=cosmos_janus_images_seq_mask,
                         cosmos_janus_state_seq_mask=cosmos_janus_state_seq_mask,
                         cosmos_janus_images_emb_mask=cosmos_janus_images_emb_mask,
-                        cosmos_janus_image_grid_thw=cosmos_janus_image_grid_thw,
                         now_state=now_state,
                         fps=args.fps,
                         spatial_gt_token_ids=latent_gt_token_ids,
@@ -1359,12 +1326,12 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--log_dir', type=str, default='./logs')
     parser.add_argument('--use_history_trajectory_janus_image', type=int, default=0,
-                        help='Compatibility option; RLBench image JSON does not use history-trajectory videos.')
+                        help='If 1, read the current Janus primary image from *_history_trajectory.mp4 next to video_path.')
 
     # Video
     parser.add_argument('--video_h', type=int, default=256)
     parser.add_argument('--video_w', type=int, default=256)
-    parser.add_argument('--video_frames', type=int, default=5)
+    parser.add_argument('--video_frames', type=int, default=16)
     parser.add_argument('--num_cond_input_frames', type=int, default=1,
                         help='Number of raw pixel frames used as Cosmos history conditioning.')
     parser.add_argument('--fps', type=int, default=10)
@@ -1387,12 +1354,12 @@ if __name__ == '__main__':
     parser.add_argument('--min_lr_ratio', type=float, default=0.05)
     parser.add_argument('--warmup_rates', type=float, default=0.05)
     parser.add_argument('--robot_state', type=int, default=0)
-    parser.add_argument('--state_placeholder_tokens', type=int, default=1,
+    parser.add_argument('--state_placeholder_tokens', type=int, default=8,
                         help='Number of pad placeholder tokens reserved for current robot state.')
-    parser.add_argument('--state_dim', type=int, default=7,
-                        help='RLBench robot state/action state dimension used by MLP state encoding.')
+    parser.add_argument('--state_dim', type=int, default=8,
+                        help='Robot state dimension used by MLP state encoding.')
     parser.add_argument('--action_dim', type=int, default=7)
-    parser.add_argument('--action_chunk', type=int, default=1)
+    parser.add_argument('--action_chunk', type=int, default=16)
     parser.add_argument('--n_epochs', type=int, default=100)
     parser.add_argument('--save_freq', type=int, default=10)
     parser.add_argument('--seed', type=int, default=42)
@@ -1423,9 +1390,9 @@ if __name__ == '__main__':
                         help='Legacy compatibility option; ignored by token latent CE training')
     parser.add_argument('--num_future_frames', type=int, default=0,
                         help='Legacy compatibility option; ignored by token latent CE training')
-    parser.add_argument('--future_frame_stride', type=int, default=1,
+    parser.add_argument('--future_frame_stride', type=int, default=0,
                         help='Legacy compatibility option; ignored by token latent CE training.')
-    parser.add_argument('--video_loss_weight', type=float, default=0.0,
+    parser.add_argument('--video_loss_weight', type=float, default=0.2,
                         help='Weight for the video loss before video freeze. After freeze it is forced to 0.')
     parser.add_argument('--latent_loss_weight', type=float, default=1.0,
                         help='Weight for latent token CE loss')
@@ -1463,7 +1430,7 @@ if __name__ == '__main__':
                         help='If 1, compute Janus prepare_inputs_embeds with grad so embed_tokens can train. If 0, keep it under no_grad.')
     parser.add_argument('--no_detach_latent_input', type=int, default=0,
                         help='If 1, do not detach latent branch inputs during training, so context token embeddings can receive gradients. Default 0 keeps legacy context-detach behavior.')
-    parser.add_argument('--state_encoding_mode', type=str, default='mlp',
+    parser.add_argument('--state_encoding_mode', type=str, default='token',
                         choices=['token', 'mlp'],
                         help='Encode robot state as tokenizer ids ("token") or normalized float values through a trainable MLP ("mlp").')
     parser.add_argument('--decosmos', type=int, default=0,
@@ -1494,11 +1461,16 @@ if __name__ == '__main__':
     args.cosmos_self_only_bridge = 0
     args.action_use_latent_prefix = 1
     args.action_self_causal_in_bridge = 1
+    args.use_history_trajectory_janus_image = 0
     args.use_value_prediction = 0
     args.use_action_value_prediction = 0
     args.value_token_mask_video_to_value = 0
     args.value_token_mask_nonvalue_to_value = 0
 
+    if args.total_latent_tokens not in (1, 2):
+        raise ValueError(
+            f"Token latent CE training requires total_latent_tokens=1 or 2, got {args.total_latent_tokens}."
+        )
     if args.cosmos_core_lr_ratio <= 0:
         raise ValueError("cosmos_core_lr_ratio must be positive.")
     if args.video_loss_weight < 0:

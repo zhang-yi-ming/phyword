@@ -8,30 +8,7 @@ DATABASE_ROOT="/mnt/nas/zhangyiming/database"
 PROJECT_ROOT="/mnt/nas/zhangyiming/last05_beta/last05_mot2_action"
 
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-if [[ "${HF_USE_PROXY:-0}" == "1" ]]; then
-  export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:10808}"
-  export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:10808}"
-  export http_proxy="${http_proxy:-$HTTP_PROXY}"
-  export https_proxy="${https_proxy:-$HTTPS_PROXY}"
-  unset ALL_PROXY all_proxy
-else
-  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
-fi
-
-retry() {
-  local attempt=1
-  local max_attempts="${HF_UPLOAD_RETRIES:-100}"
-  local sleep_seconds="${HF_UPLOAD_RETRY_SLEEP:-60}"
-  until "$@"; do
-    local status=$?
-    if (( attempt >= max_attempts )); then
-      return "$status"
-    fi
-    echo "[WARN] upload attempt ${attempt}/${max_attempts} failed with exit code ${status}; retrying in ${sleep_seconds}s..."
-    sleep "$sleep_seconds"
-    attempt=$((attempt + 1))
-  done
-}
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 
 COMMON_ARGS=(--repo-type dataset)
 CREATE_ARGS=(--repo-type dataset --exist-ok)
@@ -58,17 +35,8 @@ hf upload "$REPO_ID" \
   "${COMMON_ARGS[@]}" \
   --commit-message "Upload LIBERO spatial training data"
 
-retry hf upload-large-folder "$REPO_ID" "$DATABASE_ROOT" \
+hf upload "$REPO_ID" "$DATABASE_ROOT/rlbench" "rlbench" \
   "${COMMON_ARGS[@]}" \
-  --include "rlbench/**" \
-  --exclude "rlbench/train/json/cosmos_text_cache_rlbench_keyframe/**" \
-  --num-workers "${HF_UPLOAD_WORKERS:-8}" \
-  --no-bars
-
-retry hf upload-large-folder "$REPO_ID" "$DATABASE_ROOT" \
-  "${COMMON_ARGS[@]}" \
-  --include "rlbench/train/json/cosmos_text_cache_rlbench_keyframe/**" \
-  --num-workers "${HF_UPLOAD_WORKERS:-8}" \
-  --no-bars
+  --commit-message "Upload RLBench training data"
 
 echo "Uploaded to: https://huggingface.co/datasets/$REPO_ID"

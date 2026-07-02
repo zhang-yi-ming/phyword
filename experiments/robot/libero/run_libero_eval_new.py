@@ -28,7 +28,6 @@ import wandb
 
 import torch
 import torchvision.transforms as transforms
-from transformers import AutoModelForCausalLM
 
 # Resolve imports relative to the repository root, not the launch directory.
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -36,15 +35,16 @@ project_root_str = str(PROJECT_ROOT)
 if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
-from janus.models import VLChatProcessor, ActionTokenizer
 from models.cosmos_janus_action_spatial import (
     CosmosJanusActionSpatialMoT2Expert,
     normalize_bridge_pos_scheme,
 )
 from models.cosmos_janus_cot import build_token_sequence_mask
+from models.trex_action_backend import TrexActionModel, resolve_trex_checkpoint_path
 from cosmos_predict2._src.predict2.utils.model_loader import load_model_from_checkpoint
 from scripts.rewrite_input_prompts import PROMPT_REPLACEMENTS
 from utils.cosmos_text_cache import CosmosQwenTextEmbedder, CosmosTextEmbeddingCache
+from utils.trex_processor import load_trex_processor
 
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
@@ -68,6 +68,23 @@ JANUS_ACTION_PROMPT_SUFFIX = (
 
 def build_janus_action_prompt_suffix(use_history_trajectory: bool) -> str:
     return JANUS_ACTION_PROMPT_SUFFIX
+
+
+def build_qwen_chat_prompt(processor, user_text: str) -> str:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": user_text},
+            ],
+        }
+    ]
+    return processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 # Define task suite constants
 class TaskSuite(str, Enum):
@@ -154,6 +171,7 @@ class GenerateConfig:
     action_chunk: int = 16
     robot_state: int = 0
     state_placeholder_tokens: int = 8
+    state_dim: int = 8
     state_encoding_mode: str = "mlp"
     action_intermediate_size: int = 0                # If 0, infer slim MLP size from checkpoint; if >0, require an exact match
     model_variant: str = "mot2_action_spatial"      # This eval script builds the 2-MoT Cosmos + action-spatial model.
@@ -393,19 +411,26 @@ def load_processor_for_checkpoint(model_path: str, checkpoint_dir: str):
     candidate_paths = []
     if checkpoint_dir and checkpoint_dir not in candidate_paths:
         candidate_paths.append(checkpoint_dir)
-    if model_path and model_path not in candidate_paths:
-        candidate_paths.append(model_path)
+    if model_path:
+        try:
+            trex_ckpt = resolve_trex_checkpoint_path(model_path)
+            processor_dir = os.path.join(trex_ckpt, "processor")
+            if processor_dir not in candidate_paths:
+                candidate_paths.append(processor_dir)
+        except Exception:
+            if model_path not in candidate_paths:
+                candidate_paths.append(model_path)
 
     last_error = None
     for candidate in candidate_paths:
         try:
-            processor = VLChatProcessor.from_pretrained(candidate, trust_remote_code=True)
+            processor = load_trex_processor(candidate)
             if candidate != model_path:
-                logger.info("Loaded VLChatProcessor from %s", candidate)
+                logger.info("Loaded Qwen/T-Rex processor from %s", candidate)
             return processor
         except Exception as exc:
             last_error = exc
-            logger.info("Failed to load VLChatProcessor from %s: %s", candidate, exc)
+            logger.info("Failed to load Qwen/T-Rex processor from %s: %s", candidate, exc)
             if candidate == checkpoint_dir and checkpoint_has_processor_files(checkpoint_dir):
                 raise RuntimeError(
                     "Checkpoint directory contains tokenizer/processor files but they could not be loaded: "
@@ -418,6 +443,7 @@ def infer_checkpoint_vocab_size(state_dict: dict[str, Any]) -> Optional[int]:
     vocab_keys = [
         "janus.language_model.model.embed_tokens.weight",
         "janus.language_model.lm_head.weight",
+        "janus.vla.model.embed_tokens.weight",
     ]
     sizes = []
     for key in vocab_keys:
@@ -476,6 +502,7 @@ def validate_checkpoint_vocab_size(state_dict: dict[str, Any], tokenizer) -> Non
     vocab_keys = [
         "janus.language_model.model.embed_tokens.weight",
         "janus.language_model.lm_head.weight",
+        "janus.vla.model.embed_tokens.weight",
     ]
     mismatches = []
     checkpoint_vocab_sizes = []
@@ -584,34 +611,25 @@ def model_load(cfg: Any):
     cfg.total_spatial_tokens = int(getattr(cfg, "total_latent_tokens", 1) or 1)
     ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
 
-    # =================================================================
-    # 1. 从 checkpoint 优先加载 Processor / Tokenizer
-    # =================================================================
     print(f"Loading Processor from checkpoint/base: {base_dir} / {cfg.action_model_path or cfg.model_path}...")
-    vl_chat_processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
-    tokenizer = vl_chat_processor.tokenizer
-    action_tokenizer = ActionTokenizer(tokenizer, need_to_sub=3)
-    cfg.janus_image_start_id = getattr(vl_chat_processor, "image_start_id", None)
-    cfg.janus_image_end_id = getattr(vl_chat_processor, "image_end_id", None)
-    if cfg.janus_image_start_id is None:
-        cfg.janus_image_start_id = tokenizer.convert_tokens_to_ids("<begin_of_image>")
-    if cfg.janus_image_end_id is None:
-        cfg.janus_image_end_id = tokenizer.convert_tokens_to_ids("<end_of_image>")
-    if cfg.janus_image_start_id is None or cfg.janus_image_end_id is None:
-        raise ValueError("Could not resolve Janus image start/end token ids.")
+    processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
+    tokenizer = processor.tokenizer
+    action_tokenizer = None
+    cfg.janus_image_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    cfg.janus_image_end_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    cfg.latent_end_id = tokenizer.eos_token_id
+    cfg.trex_image_token_id = int(tokenizer.convert_tokens_to_ids("<|image_pad|>"))
 
-
-    cfg.latent_end_id = tokenizer.convert_tokens_to_ids("<|latent_end|>")
-
-
-    # =================================================================
-    # 2. 加载 Janus Action 骨架 (注意这里改为了 action_model_path)
-    # =================================================================
-    print(f"Loading Janus Action Base from {cfg.action_model_path}...")
-    janus_model = AutoModelForCausalLM.from_pretrained(
-        cfg.action_model_path, trust_remote_code=True, torch_dtype=torch.bfloat16,
-        flow=True, action_dim=cfg.action_dim, ignore_mismatched_sizes=True
+    print(f"Loading T-Rex Action Base from {cfg.action_model_path}...")
+    janus_model, trex_loading_info = TrexActionModel.from_checkpoint(
+        cfg.action_model_path,
+        action_dim=cfg.action_dim,
+        action_chunk=cfg.action_chunk,
+        torch_dtype=torch.bfloat16,
+        use_robot_state=bool(cfg.robot_state),
+        verbose=True,
     )
+    print(f"T-Rex skipped mismatched tensors={len(trex_loading_info['skipped_mismatch'])}")
     
     # =================================================================
     # 3. 加载 Cosmos 骨架 (配合猴子补丁屏蔽 T5 文本编码器)
@@ -698,7 +716,7 @@ def model_load(cfg: Any):
         'state_q99': np.array(stats_data[dataset_name]['state']['q99'], dtype=np.float32),
     }
 
-    return model, vl_chat_processor, action_tokenizer, statistic
+    return model, processor, action_tokenizer, statistic
 
 
 
@@ -1096,7 +1114,6 @@ def normalize_state_for_eval(state, statistic) -> np.ndarray:
 
 
 def build_eval_state_inputs(cfg, processor, action_tokenizer, statistic, current_state):
-    """Mirror train_cot.py current-state prompt placeholders and now_state encoding."""
     if not int(getattr(cfg, "robot_state", 0) or 0):
         return "", None, None
     if current_state is None:
@@ -1104,28 +1121,18 @@ def build_eval_state_inputs(cfg, processor, action_tokenizer, statistic, current
 
     placeholder_count = int(getattr(cfg, "state_placeholder_tokens", 8))
     pad_token_id = resolve_pad_token_id(processor)
-    placeholder_text = resolve_pad_token_text(processor) * placeholder_count
+    placeholder_text = " ".join([resolve_pad_token_text(processor)] * placeholder_count)
     placeholder_ids = torch.full((placeholder_count,), pad_token_id, dtype=torch.long)
 
     norm_state = normalize_state_for_eval(current_state, statistic)
     state_encoding_mode = str(getattr(cfg, "state_encoding_mode", "token")).lower()
     if state_encoding_mode == "mlp":
-        if norm_state.shape[-1] != 8:
-            raise ValueError(f"MLP state encoding expects state dim 8, got shape {norm_state.shape}.")
+        expected_dim = int(getattr(cfg, "state_dim", 8))
+        if norm_state.shape[-1] != expected_dim:
+            raise ValueError(f"MLP state encoding expects state_dim={expected_dim}, got shape {norm_state.shape}.")
         now_state = torch.tensor(norm_state, dtype=torch.float32)
-    elif state_encoding_mode == "token":
-        state_token_str = action_tokenizer(norm_state)
-        current_state_ids = torch.LongTensor(
-            processor.tokenizer.encode(state_token_str, add_special_tokens=False)
-        )
-        if current_state_ids.numel() != placeholder_count:
-            raise ValueError(
-                f"Encoded current state has {current_state_ids.numel()} tokens, "
-                f"but state_placeholder_tokens is {placeholder_count}."
-            )
-        now_state = current_state_ids
     else:
-        raise ValueError(f"Unsupported state_encoding_mode={state_encoding_mode!r}.")
+        raise ValueError("T-Rex action eval supports state_encoding_mode='mlp' only.")
 
     return placeholder_text, placeholder_ids, now_state
 
@@ -1244,21 +1251,12 @@ def run_episode(
             action_prompt_suffix = build_janus_action_prompt_suffix(
                 bool(getattr(cfg, "use_history_trajectory_janus_image", False))
             )
-            user_content = f"<image_placeholder>\n{eval_prompt}"
-            if action_prompt_suffix or state_tokens_str:
-                user_content += "\n"
-                if action_prompt_suffix:
-                    user_content += action_prompt_suffix
-                if state_tokens_str:
-                    user_content += state_tokens_str
-            user_prompt = processor.apply_sft_template_for_multi_turn_prompts(
-                conversations=[{"role": "<|User|>", "content": user_content}],
-                sft_format=processor.sft_format,
-                system_prompt="",
-            )
-            # Keep Assistant as an open prefix; adding Assistant content through the
-            # template would append the assistant end marker.
-            prompt_text = user_prompt + "\n\n<|Assistant|>:"
+            user_content = f"{eval_prompt}"
+            if action_prompt_suffix:
+                user_content += "\n" + action_prompt_suffix
+            if state_tokens_str:
+                user_content += "\n" + state_tokens_str
+            prompt_text = build_qwen_chat_prompt(processor, user_content)
             
             # =================================================================
             # 2. 交给 Processor 生成 Janus 专属特征
@@ -1272,35 +1270,36 @@ def run_episode(
                 )
 
             janus_inputs = processor(
-                prompt=prompt_text,
-                images=[janus_primary_image],
-                return_tensors="pt"
-            )
-            cosmos_user_content = f"<image_placeholder>\n{eval_prompt}"
-            if state_tokens_str:
-                cosmos_user_content += f"\n{state_tokens_str}"
-            cosmos_user_prompt = processor.apply_sft_template_for_multi_turn_prompts(
-                conversations=[{"role": "<|User|>", "content": cosmos_user_content}],
-                sft_format=processor.sft_format,
-                system_prompt="",
-            )
-            cosmos_prompt_text = cosmos_user_prompt + "\n\n<|Assistant|>:"
-            cosmos_janus_inputs = processor(
-                prompt=cosmos_prompt_text,
+                text=prompt_text,
                 images=[janus_primary_image],
                 return_tensors="pt",
+                padding=False,
+            )
+            cosmos_user_content = f"{eval_prompt}"
+            if state_tokens_str:
+                cosmos_user_content += "\n" + state_tokens_str
+            cosmos_prompt_text = build_qwen_chat_prompt(processor, cosmos_user_content)
+            cosmos_janus_inputs = processor(
+                text=cosmos_prompt_text,
+                images=[janus_primary_image],
+                return_tensors="pt",
+                padding=False,
             )
 
             janus_input_ids = janus_inputs.input_ids.to(device)
             janus_pixel_values = janus_inputs.pixel_values.to(device).to(dtype)
-            janus_images_seq_mask = janus_inputs.images_seq_mask.to(device)
+            janus_image_grid_thw = janus_inputs.image_grid_thw.to(device)
+            image_token_id = int(
+                getattr(cfg, "trex_image_token_id", processor.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
+            )
+            janus_images_seq_mask = janus_input_ids.eq(image_token_id)
             janus_state_seq_mask = build_token_sequence_mask(
                 janus_input_ids,
                 state_placeholder_ids,
                 require_match=bool(int(getattr(cfg, "robot_state", 0) or 0)),
                 name="current state placeholder",
             ).to(device)
-            janus_images_emb_mask = janus_inputs.images_emb_mask.to(device)
+            janus_images_emb_mask = janus_images_seq_mask
             if getattr(janus_inputs, "attention_mask", None) is None:
                 janus_attention_mask = torch.ones_like(janus_input_ids, dtype=torch.bool, device=device)
             else:
@@ -1308,6 +1307,8 @@ def run_episode(
             pad_token_id = resolve_pad_token_id(processor)
             janus_left_pad_lens = janus_input_ids.eq(pad_token_id).to(torch.long).cumprod(dim=1).sum(dim=1)
             cosmos_janus_input_ids = cosmos_janus_inputs.input_ids.to(device)
+            cosmos_janus_image_grid_thw = cosmos_janus_inputs.image_grid_thw.to(device)
+            cosmos_janus_images_seq_mask = cosmos_janus_input_ids.eq(image_token_id)
             cosmos_janus_state_seq_mask = build_token_sequence_mask(
                 cosmos_janus_input_ids,
                 state_placeholder_ids,
@@ -1359,6 +1360,7 @@ def run_episode(
                 inference_kwargs = dict(
                     janus_input_ids=janus_input_ids,
                     janus_pixel_values=janus_pixel_values,
+                    janus_image_grid_thw=janus_image_grid_thw,
                     janus_images_seq_mask=janus_images_seq_mask,
                     janus_images_emb_mask=janus_images_emb_mask,
                     first_frame=first_frame_tensor,
@@ -1373,9 +1375,10 @@ def run_episode(
                     now_state=now_state,
                     cosmos_text_embeddings=cosmos_text_embeddings,
                     cosmos_janus_input_ids=cosmos_janus_input_ids,
-                    cosmos_janus_images_seq_mask=cosmos_janus_inputs.images_seq_mask.to(device),
+                    cosmos_janus_image_grid_thw=cosmos_janus_image_grid_thw,
+                    cosmos_janus_images_seq_mask=cosmos_janus_images_seq_mask,
                     cosmos_janus_state_seq_mask=cosmos_janus_state_seq_mask,
-                    cosmos_janus_images_emb_mask=cosmos_janus_inputs.images_emb_mask.to(device),
+                    cosmos_janus_images_emb_mask=cosmos_janus_images_seq_mask,
                 )
 
                 inference_outputs = model.forward_flow_joint_inference(**inference_kwargs)
