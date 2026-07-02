@@ -15,3 +15,6 @@ rollouts
 __pycache__/
 *.pyc
 checkpoint_*
+last05_local_env.sh
+last05_local_env.*.sh
+!last05_local_env.example.sh

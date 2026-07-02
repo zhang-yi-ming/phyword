@@ -2,15 +2,15 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action}"
+LAST05_ROOT="${LAST05_ROOT:-/mnt/nas/zhangyiming/last05_beta/last05_mot2_action_fis}"
 COSMOS_ROOT="${COSMOS_ROOT:-/mnt/nas/zhangyiming/experiments}"
 EXPERIMENTS_ROOT="${EXPERIMENTS_ROOT:-/mnt/nas/zhangyiming/last05_beta/experiments_rlbench}"
-OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_spatial_rlbench_keyframe}"
+OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_fis_spatial_rlbench_keyframe}"
 PYREP_PYTHON_PATH="${PYREP_PYTHON_PATH:-/mnt/nas/zhangyawen/zhangyiming/python_pkgs}"
 LIFT3D_ROOT="${LIFT3D_ROOT:-/mnt/nas/zhangyiming/requires/LIFT3D}"
 RLBENCH_ROOT="${RLBENCH_ROOT:-${LIFT3D_ROOT}/third_party/RLBench}"
 
-RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_rlbench_keyframe_spatial_v_new}"
+RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_fis_rlbench_keyframe_spatial_v_new}"
 CHECKPOINT_NAME="${CHECKPOINT_NAME:-}"
 RUN_DIR="${OUTPUT_ROOT_DIR}/${RUN_NAME}"
 if [[ -n "${PRETRAINED_CHECKPOINT:-}" ]]; then
@@ -46,11 +46,14 @@ SHELL_LOG="${LOG_DIR}/test_rlbench_trainset_attn_vis_shell_${EVAL_ARTIFACT_NAME}
 BASH_HPARAMS_FILE="${ATTENTION_VISUALIZATION_DIR}/test_rlbench_trainset_attn_vis_hparams_${EVAL_ARTIFACT_NAME}.env"
 
 DATA_JSON="${DATA_JSON:-/mnt/nas/zhangyiming/database/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"
-JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
-ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+ACTION_EXPERT_PATH="${ACTION_EXPERT_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr}"
+JANUS_INIT_MODE="${JANUS_INIT_MODE:-janus_pro_ae_flow}"
+JANUS_PRO_MODEL_PATH="${JANUS_PRO_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B}"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-${JANUS_PRO_MODEL_PATH}}"
+ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-${ACTION_EXPERT_PATH}}"
 COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
-COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH-/mnt/nas/zhangyiming/database/rlbench/train/json/cosmos_text_cache_rlbench_keyframe}"
+COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-/mnt/nas/zhangyiming/database/rlbench/train/json/cosmos_text_cache_rlbench_keyframe}"
 OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
@@ -98,7 +101,7 @@ case "${SPATIAL_TOKEN_MODE}" in
     ;;
 esac
 
-DEFAULT_EXTRA_SPECIAL_TOKENS="</PAD>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
+DEFAULT_EXTRA_SPECIAL_TOKENS="</PAD>,</MOVE>,</PICK>,</PLACE>,</ROTATE>,</PULL>,</PUSH>,</NONE>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
 EXTRA_SPECIAL_TOKENS="${EXTRA_SPECIAL_TOKENS:-${DEFAULT_EXTRA_SPECIAL_TOKENS}}"
 USE_SPATIAL_HIDDEN_SIM_LOSS="${USE_SPATIAL_HIDDEN_SIM_LOSS:-1}"
 SPATIAL_HIDDEN_SIM_LOSS_MODE="${SPATIAL_HIDDEN_SIM_LOSS_MODE:-siglip}"
@@ -160,7 +163,7 @@ write_hparam() {
     SCRIPT_DIR LAST05_ROOT COSMOS_ROOT EXPERIMENTS_ROOT OUTPUT_ROOT_DIR RUN_NAME RUN_DIR CHECKPOINT_NAME PRETRAINED_CHECKPOINT \
     EVAL_TIMESTAMP EVAL_ARTIFACT_NAME ATTENTION_VISUALIZATION_DIR LOG_DIR SHELL_LOG BASH_HPARAMS_FILE \
     OMP_NUM_THREADS HF_HUB_OFFLINE \
-    DATA_JSON JANUS_MODEL_PATH ACTION_MODEL_PATH COSMOS_MODEL_PATH COSMOS_EXPERIMENT_NAME COSMOS_TEXT_CACHE_PATH \
+    DATA_JSON ACTION_EXPERT_PATH JANUS_INIT_MODE JANUS_PRO_MODEL_PATH JANUS_MODEL_PATH ACTION_MODEL_PATH COSMOS_MODEL_PATH COSMOS_EXPERIMENT_NAME COSMOS_TEXT_CACHE_PATH \
     ACTION_DIM ACTION_CHUNK VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES IMG_LATENTS_PER_FUTURE STATE_LATENTS_PER_FUTURE NUM_FUTURE_FRAMES FUTURE_FRAME_STRIDE \
     ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_DIM STATE_ENCODING_MODE \
     BRIDGE_POS_SCHEME ACTION_SELF_CAUSAL_IN_BRIDGE ACTION_USE_LATENT_PREFIX COSMOS_SELF_ONLY_BRIDGE DECOSMOS \
@@ -177,8 +180,8 @@ write_hparam() {
 } > "$BASH_HPARAMS_FILE"
 
 cd "$LAST05_ROOT"
-source /root/miniconda3/bin/activate /root/miniconda3/envs/last05
-export PATH=/root/miniconda3/envs/last05/bin:$PATH
+source /root/miniconda3/bin/activate /root/miniconda3/envs/last05_qwen3vl
+export PATH=/root/miniconda3/envs/last05_qwen3vl/bin:$PATH
 export PYTHONPATH="${PYREP_PYTHON_PATH}:${LIFT3D_ROOT}:${RLBENCH_ROOT}:${COSMOS_ROOT}:${LAST05_ROOT}:${PYTHONPATH:-}"
 export OMP_NUM_THREADS
 export HF_HUB_OFFLINE
@@ -204,6 +207,9 @@ python -u "${SCRIPT_DIR}/run_rlbench_trainset_attn_vis_mot2_action.py" \
   --pretrained_checkpoint "$PRETRAINED_CHECKPOINT" \
   --model_path "$JANUS_MODEL_PATH" \
   --action_model_path "$ACTION_MODEL_PATH" \
+  --action_expert_path "$ACTION_EXPERT_PATH" \
+  --janus_init_mode "$JANUS_INIT_MODE" \
+  --janus_pro_model_path "$JANUS_PRO_MODEL_PATH" \
   --cosmos_model_path "$COSMOS_MODEL_PATH" \
   --cosmos_experiment_name "$COSMOS_EXPERIMENT_NAME" \
   --cosmos_text_cache_path "$COSMOS_TEXT_CACHE_PATH" \

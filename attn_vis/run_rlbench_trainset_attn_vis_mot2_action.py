@@ -104,8 +104,11 @@ def resolve_spatial_token_args(cfg: "TrainsetAttnVisConfig") -> None:
 @dataclass
 class TrainsetAttnVisConfig:
     pretrained_checkpoint: str = ""
-    model_path: str = "/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr"
+    model_path: str = "/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B"
     action_model_path: str = "/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr"
+    action_expert_path: str = "/mnt/nas/zhangyiming/database/ckpt/pretrained/LaST0_Pretrain_AE_chunk16/tfmr"
+    janus_init_mode: str = "janus_pro_ae_flow"
+    janus_pro_model_path: str = "/mnt/nas/zhangyiming/database/ckpt/pretrained/Janus-Pro-1B"
     cosmos_model_path: str = (
         "/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/"
         "d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt"
@@ -335,6 +338,158 @@ def ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size: 
         language_model.config.vocab_size = target_vocab
 
 
+def initialize_action_special_token_rows(janus_model, tokenizer, log_file=None) -> None:
+    token_sources = {
+        "</MOVE>": ("move",),
+        "</PICK>": ("pick",),
+        "</PLACE>": ("place",),
+        "</ROTATE>": ("rotate",),
+        "</PULL>": ("pull",),
+        "</PUSH>": ("push",),
+        "</NONE>": ("none",),
+    }
+    language_model = janus_model.language_model
+    embed = language_model.get_input_embeddings()
+    embed_weight = embed.weight
+    lm_head = getattr(language_model, "lm_head", None)
+    lm_head_weight = getattr(lm_head, "weight", None) if lm_head is not None else None
+    weights_tied = (
+        lm_head_weight is not None
+        and embed_weight.shape == lm_head_weight.shape
+        and embed_weight.data_ptr() == lm_head_weight.data_ptr()
+    )
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    def resolve_target_id(token_text: str) -> Optional[int]:
+        token_id = tokenizer.convert_tokens_to_ids(token_text)
+        if token_id is None or int(token_id) < 0:
+            log_message(f"  skip {token_text}: token is not in tokenizer.", log_file)
+            return None
+        if unk_id is not None and int(token_id) == int(unk_id) and token_text != getattr(tokenizer, "unk_token", None):
+            log_message(f"  skip {token_text}: token resolves to unk id {unk_id}.", log_file)
+            return None
+        if int(token_id) >= int(embed_weight.shape[0]):
+            log_message(f"  skip {token_text}: token id {int(token_id)} exceeds embedding rows {embed_weight.shape[0]}.", log_file)
+            return None
+        if lm_head_weight is not None and int(token_id) >= int(lm_head_weight.shape[0]):
+            log_message(f"  skip {token_text}: token id {int(token_id)} exceeds lm_head rows {lm_head_weight.shape[0]}.", log_file)
+            return None
+        return int(token_id)
+
+    def encode_source_ids(source_words) -> list[int]:
+        ids = []
+        for word in source_words:
+            word_ids = tokenizer.encode(str(word), add_special_tokens=False)
+            ids.extend(int(idx) for idx in word_ids if 0 <= int(idx) < int(embed_weight.shape[0]))
+        return ids
+
+    log_message("Initializing action special token embedding/lm_head rows from word tokens...", log_file)
+    with torch.no_grad():
+        for target_token, source_words in token_sources.items():
+            target_id = resolve_target_id(target_token)
+            if target_id is None:
+                continue
+            source_ids = encode_source_ids(source_words)
+            if not source_ids:
+                log_message(f"  skip {target_token}: could not encode source words {source_words}.", log_file)
+                continue
+            source_tensor = torch.tensor(source_ids, device=embed_weight.device, dtype=torch.long)
+            embed_weight[target_id].copy_(embed_weight.index_select(0, source_tensor).mean(dim=0))
+            if lm_head_weight is not None and not weights_tied:
+                head_source_tensor = source_tensor.to(device=lm_head_weight.device)
+                lm_head_weight[target_id].copy_(lm_head_weight.index_select(0, head_source_tensor).mean(dim=0))
+            log_message(
+                f"  {target_token} <- mean({', '.join(source_words)}) "
+                f"target_id={target_id}, source_ids={source_ids}, tied_lm_head={int(weights_tied)}",
+                log_file,
+            )
+
+
+def initialize_janus_like_training(cfg: TrainsetAttnVisConfig, tokenizer, log_file=None):
+    janus_init_mode = str(getattr(cfg, "janus_init_mode", "ae") or "ae").strip().lower()
+    if janus_init_mode not in ("ae", "janus_pro_ae_flow"):
+        raise ValueError(
+            "--janus_init_mode must be one of ['ae', 'janus_pro_ae_flow'], "
+            f"got {cfg.janus_init_mode!r}."
+        )
+    if janus_init_mode == "janus_pro_ae_flow" and not str(getattr(cfg, "janus_pro_model_path", "") or "").strip():
+        raise ValueError("--janus_pro_model_path is required when --janus_init_mode=janus_pro_ae_flow.")
+
+    action_expert_path = str(getattr(cfg, "action_expert_path", "") or getattr(cfg, "action_model_path", "") or "").strip()
+    janus_load_path = str(getattr(cfg, "janus_pro_model_path", "") if janus_init_mode == "janus_pro_ae_flow" else action_expert_path)
+    if not janus_load_path:
+        raise ValueError("Could not resolve Janus load path for visualization.")
+
+    log_message(f"Loading Janus checkpoint from {janus_load_path} (janus_init_mode={janus_init_mode})", log_file)
+    janus_model = AutoModelForCausalLM.from_pretrained(
+        janus_load_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        flow=True,
+        action_dim=cfg.action_dim,
+        ignore_mismatched_sizes=True,
+    )
+    ae_fast_layer_state = None
+    if janus_init_mode == "janus_pro_ae_flow":
+        if not action_expert_path:
+            raise ValueError("--action_expert_path is required when --janus_init_mode=janus_pro_ae_flow.")
+        log_message(f"Loading AE action expert checkpoint for flow initialization from {action_expert_path}", log_file)
+        ae_model = AutoModelForCausalLM.from_pretrained(
+            action_expert_path,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            flow=True,
+            action_dim=cfg.action_dim,
+            ignore_mismatched_sizes=True,
+        )
+        flow_component_names = ("x_embedder", "t_embedder", "final_layer", "state_embedder")
+        ae_layers = list(ae_model.language_model.model.layers)
+        ae_fast_layer_state = [
+            {k: v.detach().cpu().clone() for k, v in layer.state_dict().items()}
+            for layer in ae_layers[-4:]
+        ]
+        ae_state = ae_model.state_dict()
+        copied_flow_keys = []
+        missing_flow_keys = []
+        mismatched_flow_keys = []
+        for name, param in janus_model.named_parameters():
+            if not any(component in name for component in flow_component_names):
+                continue
+            ae_param = ae_state.get(name)
+            if ae_param is None:
+                missing_flow_keys.append(name)
+                continue
+            if tuple(ae_param.shape) != tuple(param.shape):
+                mismatched_flow_keys.append((name, tuple(param.shape), tuple(ae_param.shape)))
+                continue
+            param.data.copy_(ae_param.to(device=param.device, dtype=param.dtype))
+            copied_flow_keys.append(name)
+        del ae_state
+        del ae_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if not copied_flow_keys:
+            raise RuntimeError(
+                "janus_pro_ae_flow did not copy any AE flow component weights. "
+                "Expected keys containing x_embedder/t_embedder/final_layer/state_embedder."
+            )
+        if missing_flow_keys or mismatched_flow_keys:
+            raise RuntimeError(
+                "Failed to initialize all Janus flow components from AE checkpoint. "
+                f"missing={missing_flow_keys[:20]} total_missing={len(missing_flow_keys)}; "
+                f"mismatched={mismatched_flow_keys[:20]} total_mismatched={len(mismatched_flow_keys)}"
+            )
+        log_message(
+            "Initialized AE flow components into Janus-Pro base while keeping Janus-Pro "
+            f"tokenizer/embed_tokens/lm_head. copied_keys={len(copied_flow_keys)}",
+            log_file,
+        )
+    ensure_janus_tokenizer_alignment(janus_model, tokenizer)
+    initialize_action_special_token_rows(janus_model, tokenizer, log_file)
+    return janus_model, ae_fast_layer_state, janus_init_mode
+
+
 def validate_checkpoint_vocab_size(state_dict: dict[str, Any], tokenizer) -> None:
     tokenizer_vocab = int(len(tokenizer))
     vocab_keys = [
@@ -371,7 +526,9 @@ def model_load(cfg: TrainsetAttnVisConfig, log_file=None):
     cfg.total_spatial_tokens = int(cfg.total_latent_tokens)
 
     ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
-    processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
+    janus_init_mode = str(getattr(cfg, "janus_init_mode", "ae") or "ae").strip().lower()
+    processor_model_path = cfg.janus_pro_model_path if janus_init_mode == "janus_pro_ae_flow" else (cfg.action_expert_path or cfg.action_model_path or cfg.model_path)
+    processor = load_processor_for_checkpoint(processor_model_path, base_dir)
     if str(getattr(cfg, "extra_special_tokens", "") or "").strip():
         added = processor.add_extra_special_tokens(cfg.extra_special_tokens)
         log_message(f"Added extra special tokens for visualization tokenizer: {added}", log_file)
@@ -380,15 +537,7 @@ def model_load(cfg: TrainsetAttnVisConfig, log_file=None):
     cfg.janus_image_end_id = getattr(processor, "image_end_id", None) or tokenizer.convert_tokens_to_ids("<end_of_image>")
     cfg.latent_end_id = tokenizer.convert_tokens_to_ids("<|latent_end|>")
 
-    log_message(f"Loading Janus action expert from {cfg.action_model_path}", log_file)
-    janus_model = AutoModelForCausalLM.from_pretrained(
-        cfg.action_model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        flow=True,
-        action_dim=cfg.action_dim,
-        ignore_mismatched_sizes=True,
-    )
+    janus_model, ae_fast_layer_state, janus_init_mode = initialize_janus_like_training(cfg, tokenizer, log_file)
 
     import cosmos_predict2._src.predict2.models.text2world_model_rectified_flow as t2w_module
 
@@ -418,6 +567,19 @@ def model_load(cfg: TrainsetAttnVisConfig, log_file=None):
         cfg.checkpoint_vocab_size = int(checkpoint_vocab_size)
 
     model = CosmosJanusActionSpatialMoT2Expert(cosmos_wrapper.net, cosmos_wrapper.tokenizer, janus_model, cfg)
+    if janus_init_mode == "janus_pro_ae_flow":
+        fast_layers = list(getattr(model, "fast_action_layers", []))
+        if not fast_layers:
+            raise RuntimeError("FiS model has no fast_action_layers to initialize from AE.")
+        if ae_fast_layer_state is None or len(ae_fast_layer_state) < len(fast_layers):
+            raise RuntimeError(
+                "Missing AE fast layer state for FiS initialization: "
+                f"needed={len(fast_layers)}, available={0 if ae_fast_layer_state is None else len(ae_fast_layer_state)}."
+            )
+        for dst_layer, src_state in zip(fast_layers, ae_fast_layer_state[-len(fast_layers):]):
+            dst_layer.load_state_dict(src_state, strict=True)
+        log_message(f"Initialized FiS fast_action_layers from AE last {len(fast_layers)} transformer layers.", log_file)
+        del ae_fast_layer_state
     model.set_cosmos_inference_runtime_from_wrapper(cosmos_wrapper)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
@@ -535,7 +697,14 @@ def _overlay_heatmap(
 
 
 class AttentionMapRecorder:
-    def __init__(self, cfg: TrainsetAttnVisConfig, num_layers: int, log_file=None):
+    def __init__(
+        self,
+        cfg: TrainsetAttnVisConfig,
+        num_layers: int,
+        slow_layer_count: int,
+        fast_layer_count: int,
+        log_file=None,
+    ):
         self.cfg = cfg
         self.log_file = log_file
         self.output_dir = str(getattr(cfg, "attention_visualization_dir", "") or "").strip()
@@ -544,6 +713,19 @@ class AttentionMapRecorder:
         if self.total_spatial_tokens not in (1, 2):
             raise ValueError(f"total_latent_tokens must be 1 or 2, got {self.total_spatial_tokens}.")
         self.num_layers = int(num_layers)
+        self.slow_layer_count = int(slow_layer_count)
+        self.fast_layer_count = int(fast_layer_count)
+        self.first_action_layer_idx = self.slow_layer_count
+        if self.slow_layer_count <= 0 or self.fast_layer_count <= 0:
+            raise ValueError(
+                "FiS attention visualization expects non-empty slow and fast layer groups, "
+                f"got slow={self.slow_layer_count}, fast={self.fast_layer_count}."
+            )
+        if self.slow_layer_count + self.fast_layer_count != self.num_layers:
+            raise ValueError(
+                "FiS layer counts must cover all MoT wrappers: "
+                f"slow={self.slow_layer_count}, fast={self.fast_layer_count}, total={self.num_layers}."
+            )
         self.alpha = float(getattr(cfg, "attention_visualization_alpha", 0.45) or 0.45)
         self.tile_size = max(16, int(getattr(cfg, "attention_visualization_tile_size", 256) or 256))
         self.top_ratio = getattr(cfg, "attention_visualization_top_ratio", None)
@@ -744,19 +926,23 @@ class AttentionMapRecorder:
         layer_idx = int(layer_idx)
         query_kind = str(query_kind)
         if query_kind == "spatial":
+            if layer_idx < 0 or layer_idx >= self.slow_layer_count:
+                return
             if layer_idx == 0:
                 self.spatial_call_index += 1
             if self.spatial_call_index < 0:
                 raise RuntimeError("Spatial recorder saw a nonzero layer before layer 0.")
             label = f"spatial{self.spatial_call_index}"
-            if label not in {"spatial0", "spatial1"}:
+            if self.spatial_call_index >= self.total_spatial_tokens:
                 return
         elif query_kind == "action":
-            if layer_idx == 0:
+            if layer_idx < self.first_action_layer_idx or layer_idx >= self.num_layers:
+                return
+            if layer_idx == self.first_action_layer_idx:
                 self.action_denoise_step += 1
                 self.capture_current_action_step = self.action_denoise_step == self._target_action_step()
             if self.action_denoise_step < 0:
-                raise RuntimeError("Action recorder saw a nonzero layer before layer 0.")
+                raise RuntimeError("Action recorder saw a fast layer before the first fast layer.")
             if not self.capture_current_action_step:
                 return
             label = "action"
@@ -807,17 +993,35 @@ class AttentionMapRecorder:
     def _summary_columns(self) -> list[tuple[str, str, Image.Image, str]]:
         if self.action_base_image is None or self.cosmos_cond_base_image is None or self.cosmos_future_base_image is None:
             raise RuntimeError("Attention recorder has no base images for the active query.")
-        return [
-            ("spatial0", "cosmos_cond", self.cosmos_cond_base_image, "s0 -> cosmos cond"),
-            ("spatial0", "cosmos_future", self.cosmos_future_base_image, "s0 -> cosmos future"),
-            ("spatial0", "action_image", self.action_base_image, "s0 -> action img"),
-            ("spatial1", "cosmos_cond", self.cosmos_cond_base_image, "s1 -> cosmos cond"),
-            ("spatial1", "cosmos_future", self.cosmos_future_base_image, "s1 -> cosmos future"),
-            ("spatial1", "action_image", self.action_base_image, "s1 -> action img"),
-            ("action", "cosmos_cond", self.cosmos_cond_base_image, "act -> cosmos cond"),
-            ("action", "cosmos_future", self.cosmos_future_base_image, "act -> cosmos future"),
-            ("action", "action_image", self.action_base_image, "act -> action img"),
-        ]
+        columns = []
+        for spatial_idx in range(self.total_spatial_tokens):
+            label = f"spatial{spatial_idx}"
+            short = f"s{spatial_idx}"
+            columns.extend(
+                [
+                    (label, "cosmos_cond", self.cosmos_cond_base_image, f"{short} -> cosmos cond"),
+                    (label, "cosmos_future", self.cosmos_future_base_image, f"{short} -> cosmos future"),
+                    (label, "action_image", self.action_base_image, f"{short} -> action img"),
+                ]
+            )
+        columns.extend(
+            [
+                ("action", "cosmos_cond", self.cosmos_cond_base_image, "act -> cosmos cond"),
+                ("action", "cosmos_future", self.cosmos_future_base_image, "act -> cosmos future"),
+                ("action", "action_image", self.action_base_image, "act -> action img"),
+            ]
+        )
+        return columns
+
+    def _blank_tile(self, label: str) -> Image.Image:
+        tile = Image.new("RGB", (self.tile_size, self.tile_size), (48, 52, 58))
+        draw = ImageDraw.Draw(tile)
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+        _draw_text_with_outline(draw, (7, 5), label, fill=(180, 186, 195), font=font)
+        return tile
 
     def _render_summary_overview(self) -> Image.Image:
         row_label_w = 86
@@ -840,7 +1044,11 @@ class AttentionMapRecorder:
             y = col_label_h + layer_idx * self.tile_size
             draw.text((8, y + max(4, self.tile_size // 2 - 6)), f"layer_{layer_idx:02d}", fill=(245, 248, 252), font=font)
             for col_idx, (query_label, region_name, base_image, _) in enumerate(columns):
-                record = self.summary_records[query_label][layer_idx][region_name]
+                record = self.summary_records.get(query_label, {}).get(layer_idx, {}).get(region_name)
+                if record is None:
+                    tile = self._blank_tile("n/a")
+                    canvas.paste(tile, (row_label_w + col_idx * self.tile_size, y))
+                    continue
                 heat = np.asarray(record["heat"], dtype=np.float32)
                 score = float(record["score"])
                 overlay = _overlay_heatmap(base_image, heat, self.tile_size, self.alpha, self.top_ratio, self.top_softness)
@@ -852,15 +1060,16 @@ class AttentionMapRecorder:
     def _save_query(self) -> list[str]:
         if not self.summary_records:
             raise RuntimeError("No attention maps were captured for the active query.")
-        required = ["spatial0", "spatial1", "action"]
+        required = [f"spatial{idx}" for idx in range(self.total_spatial_tokens)] + ["action"]
         missing_queries = [label for label in required if label not in self.summary_records]
         if missing_queries:
             raise RuntimeError(f"Missing attention summary query records: {missing_queries}.")
         for label in required:
-            missing_layers = [idx for idx in range(self.num_layers) if idx not in self.summary_records[label]]
+            expected_layers = range(self.first_action_layer_idx, self.num_layers) if label == "action" else range(0, self.slow_layer_count)
+            missing_layers = [idx for idx in expected_layers if idx not in self.summary_records[label]]
             if missing_layers:
                 raise RuntimeError(f"Missing summary maps for {label}: layers={missing_layers[:8]}.")
-            for layer_idx in range(self.num_layers):
+            for layer_idx in expected_layers:
                 missing_regions = [
                     region for region in ("cosmos_cond", "cosmos_future", "action_image")
                     if region not in self.summary_records[label][layer_idx]
@@ -883,7 +1092,17 @@ def install_attention_map_recorder(model, cfg: TrainsetAttnVisConfig, log_file=N
     wrappers = getattr(model, "mot_attention_wrappers", None)
     if wrappers is None or len(wrappers) == 0:
         raise AttributeError("Model has no mot_attention_wrappers to instrument for attention visualization.")
-    recorder = AttentionMapRecorder(cfg, num_layers=len(wrappers), log_file=log_file)
+    slow_wrappers = getattr(model, "slow_mot_attention_wrappers", None)
+    fast_wrappers = getattr(model, "fast_mot_attention_wrappers", None)
+    slow_layer_count = len(slow_wrappers) if slow_wrappers is not None else len(wrappers)
+    fast_layer_count = len(fast_wrappers) if fast_wrappers is not None else 0
+    recorder = AttentionMapRecorder(
+        cfg,
+        num_layers=len(wrappers),
+        slow_layer_count=slow_layer_count,
+        fast_layer_count=fast_layer_count,
+        log_file=log_file,
+    )
 
     def make_patched_forward_action_prefix_and_cache(layer_idx: int):
         def patched_forward_action_prefix_and_cache(
@@ -932,7 +1151,7 @@ def install_attention_map_recorder(model, cfg: TrainsetAttnVisConfig, log_file=N
                     action_valid_mask=action_valid_mask,
                     action_tail_token_count=action_tail_token_count,
                 )
-                if append_to_cache:
+                if layer_idx < recorder.slow_layer_count:
                     if action_valid_mask is None:
                         q_for_spatial = q_a[:, -1:, :, :]
                         q_allowed_mask = mask[0, 0, -1:, :]
@@ -1037,7 +1256,8 @@ def install_attention_map_recorder(model, cfg: TrainsetAttnVisConfig, log_file=N
 
     model._attention_map_recorder = recorder
     log_message(
-        f"Installed MoT2 attention recorder: dir={output_dir}, layers={len(wrappers)}, "
+        f"Installed FiS MoT2 attention recorder: dir={output_dir}, layers={len(wrappers)} "
+        f"(slow={slow_layer_count}, fast={fast_layer_count}), "
         f"action_chunk={cfg.action_chunk}, capture_mode={cfg.attention_visualization_capture_mode}, "
         f"top_ratio={cfg.attention_visualization_top_ratio}, top_softness={cfg.attention_visualization_top_softness}",
         log_file,
