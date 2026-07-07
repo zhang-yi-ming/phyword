@@ -15,6 +15,7 @@
 
 import collections
 import math
+import types
 from collections import namedtuple
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -33,7 +34,26 @@ except ImportError:
 import numpy as np
 import torch
 import torch.amp as amp
-import transformer_engine as te
+try:
+    import transformer_engine as te
+except Exception:
+    class _RMSNorm(torch.nn.Module):
+        def __init__(self, normalized_shape, eps=1e-6):
+            super().__init__()
+            self.normalized_shape = normalized_shape
+            self.eps = eps
+            self.weight = torch.nn.Parameter(torch.ones(normalized_shape))
+
+        def reset_parameters(self):
+            torch.nn.init.ones_(self.weight)
+
+        def forward(self, x):
+            dtype = x.dtype
+            x_float = x.float()
+            x_norm = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+            return x_norm.to(dtype) * self.weight.to(dtype)
+
+    te = types.SimpleNamespace(pytorch=types.SimpleNamespace(RMSNorm=_RMSNorm))
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from torch import nn
@@ -50,8 +70,22 @@ from torchvision import transforms
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
-except ImportError:
-    from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+except Exception:
+    try:
+        from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+    except Exception:
+        def apply_rotary_pos_emb(tensor, rope_emb, tensor_format="bshd", fused=True):
+            if tensor_format != "bshd":
+                raise NotImplementedError(f"RoPE fallback only supports bshd tensor format, got {tensor_format!r}.")
+            del fused
+            rope_emb = rope_emb.to(device=tensor.device, dtype=torch.float32)
+            if rope_emb.ndim == 4 and rope_emb.shape[0] == tensor.shape[1]:
+                rope_emb = rope_emb.permute(1, 0, 2, 3)
+            cos = torch.cos(rope_emb).to(dtype=tensor.dtype)
+            sin = torch.sin(rope_emb).to(dtype=tensor.dtype)
+            x1, x2 = tensor.chunk(2, dim=-1)
+            rotated = torch.cat((-x2, x1), dim=-1)
+            return tensor * cos + rotated * sin
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from cosmos_predict2._src.imaginaire.attention import attention

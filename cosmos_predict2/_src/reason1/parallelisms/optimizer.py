@@ -28,7 +28,13 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.reason1.configs.default.model_config import FSDP2ModelConfig
-from cosmos_predict2._src.reason1.utils.fused_adam import FusedAdam
+try:
+    from cosmos_predict2._src.reason1.utils.fused_adam import FusedAdam
+except Exception as exc:
+    FusedAdam = None
+    _FUSED_ADAM_IMPORT_ERROR = exc
+else:
+    _FUSED_ADAM_IMPORT_ERROR = None
 
 
 def _optimizer_cls(params: List[nn.Parameter], optimizer_kwargs: Dict[str, Any], name: str):
@@ -37,14 +43,18 @@ def _optimizer_cls(params: List[nn.Parameter], optimizer_kwargs: Dict[str, Any],
     elif name == "AdamW":
         optimizer = torch.optim.AdamW(params, **optimizer_kwargs)
     elif name == "FusedAdam":
-        optimizer = FusedAdam(
-            params,
-            lr=optimizer_kwargs["lr"],
-            weight_decay=optimizer_kwargs["weight_decay"],
-            betas=optimizer_kwargs["betas"],
-            capturable=True,
-            master_weights=True,
-        )
+        if FusedAdam is None:
+            log.warning(f"FusedAdam unavailable, falling back to AdamW: {_FUSED_ADAM_IMPORT_ERROR}")
+            optimizer = torch.optim.AdamW(params, **optimizer_kwargs)
+        else:
+            optimizer = FusedAdam(
+                params,
+                lr=optimizer_kwargs["lr"],
+                weight_decay=optimizer_kwargs["weight_decay"],
+                betas=optimizer_kwargs["betas"],
+                capturable=True,
+                master_weights=True,
+            )
     else:
         raise NotImplementedError(f"Optimizer {name} not added.")
     return optimizer

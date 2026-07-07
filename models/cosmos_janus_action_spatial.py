@@ -79,6 +79,7 @@ class MoTAttentionWrapper2(nn.Module):
         self.cached_v_a_prefix = None
         self.cached_action_prefix_valid_mask = None
         self.detach_video_kv = False
+        self.detach_video_kv_for_action = False
 
         if self.interleave_video_qk:
             head_dim = int(getattr(original_attn, "head_dim", action_bridge.head_dim))
@@ -280,30 +281,52 @@ class MoTAttentionWrapper2(nn.Module):
         q_a, k_a, v_a = self.action_bridge.get_branch_qkv(self.current_x_action)
         q_a, k_a = self._apply_action_rotary(q_a, k_a, self.current_rotary_payload)
 
-        k_video = k_v.detach() if self.detach_video_kv else k_v
-        v_video = v_v.detach() if self.detach_video_kv else v_v
-        q = torch.cat([q_v, q_a], dim=1)
-        k = torch.cat([k_video, k_a], dim=1)
-        v = torch.cat([v_video, v_a], dim=1)
-
         S_v = q_v.shape[1]
         S_a = q_a.shape[1]
-        query_valid_mask = self._query_valid_mask(
-            [S_v, self.current_action_valid_mask if self.current_action_valid_mask is not None else S_a],
-            q.device,
-            q.shape[0],
-        )
-        bridge_mask = self._build_bridge_mask(
-            S_v,
-            S_a,
-            q.device,
-            action_valid_mask=self.current_action_valid_mask,
-            action_tail_token_count=self.current_action_tail_token_count,
-        )
-        result = self._bridge_sdpa(q, k, v, attn_mask=bridge_mask, query_valid_mask=query_valid_mask)
+        if self.detach_video_kv_for_action and not self.detach_video_kv:
+            res_v = self.original_attn.attn_op(q_v, k_v, v_v)
+            k = torch.cat([k_v.detach(), k_a], dim=1)
+            v = torch.cat([v_v.detach(), v_a], dim=1)
+            action_mask = self._build_action_only_mask(
+                S_v,
+                S_a,
+                q_a.device,
+                action_valid_mask=self.current_action_valid_mask,
+                action_tail_token_count=self.current_action_tail_token_count,
+            )
+            action_query_valid_mask = self.current_action_valid_mask
+            if action_query_valid_mask is None:
+                action_query_valid_mask = torch.ones((q_a.shape[0], S_a), device=q_a.device, dtype=torch.bool)
+            res_a = self._bridge_sdpa(
+                q_a,
+                k,
+                v,
+                attn_mask=action_mask,
+                query_valid_mask=action_query_valid_mask,
+            )
+        else:
+            k_video = k_v.detach() if self.detach_video_kv else k_v
+            v_video = v_v.detach() if self.detach_video_kv else v_v
+            q = torch.cat([q_v, q_a], dim=1)
+            k = torch.cat([k_video, k_a], dim=1)
+            v = torch.cat([v_video, v_a], dim=1)
 
-        res_v = result[:, :S_v]
-        res_a = result[:, S_v:]
+            query_valid_mask = self._query_valid_mask(
+                [S_v, self.current_action_valid_mask if self.current_action_valid_mask is not None else S_a],
+                q.device,
+                q.shape[0],
+            )
+            bridge_mask = self._build_bridge_mask(
+                S_v,
+                S_a,
+                q.device,
+                action_valid_mask=self.current_action_valid_mask,
+                action_tail_token_count=self.current_action_tail_token_count,
+            )
+            result = self._bridge_sdpa(q, k, v, attn_mask=bridge_mask, query_valid_mask=query_valid_mask)
+
+            res_v = result[:, :S_v]
+            res_a = result[:, S_v:]
         self.next_x_action = self.action_bridge.post_attention(
             self.current_x_action,
             res_a,
@@ -456,6 +479,14 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
 
         self.janus_image_start_id = getattr(config, "janus_image_start_id", None)
         self.janus_image_end_id = getattr(config, "janus_image_end_id", None)
+        self.action_detach_slow_prefix = bool(int(getattr(config, "action_detach_slow_prefix", 0) or 0))
+        self.action_detach_video_branch = bool(int(getattr(config, "action_detach_video_branch", 0) or 0))
+        self.action_detach_slow_video_branch = bool(
+            int(getattr(config, "action_detach_slow_video_branch", 0) or 0)
+        )
+        setattr(self.config, "action_detach_slow_prefix", int(self.action_detach_slow_prefix))
+        setattr(self.config, "action_detach_video_branch", int(self.action_detach_video_branch))
+        setattr(self.config, "action_detach_slow_video_branch", int(self.action_detach_slow_video_branch))
         self.state_encoding_mode = str(getattr(config, "state_encoding_mode", "mlp")).lower()
         if self.state_encoding_mode not in ("token", "mlp"):
             raise ValueError(f"state_encoding_mode must be 'token' or 'mlp', got {self.state_encoding_mode!r}.")
@@ -548,12 +579,14 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             if i < self.slow_mot_layer_count:
                 janus_layer = janus_layers[i]
                 wrapper_list = self.slow_mot_attention_wrappers
+                detach_video_kv_for_action = self.action_detach_slow_video_branch
             else:
                 fast_idx = i - self.slow_mot_layer_count
                 if fast_idx >= self.fast_mot_layer_count:
                     break
                 janus_layer = self.fast_action_layers[fast_idx]
                 wrapper_list = self.fast_mot_attention_wrappers
+                detach_video_kv_for_action = self.action_detach_video_branch
             actual_block = cosmos_block
             if hasattr(cosmos_block, "_checkpoint_wrapped_module"):
                 actual_block = cosmos_block._checkpoint_wrapped_module
@@ -589,6 +622,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 action_bridge,
                 interleave_video_qk=self.bridge_pos_scheme == "mrope_interleave",
             )
+            mot_attn.detach_video_kv_for_action = detach_video_kv_for_action
             actual_block.self_attn = mot_attn
             original_forward = actual_block.forward
 
@@ -1290,7 +1324,8 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
 
         time_tokens = self.janus.t_embedder(timestep_act).unsqueeze(1).to(dtype=self.dtype)
         action_tokens = self.janus.x_embedder(action_latent.to(dtype=self.dtype))
-        x_fast = torch.cat([x_slow, time_tokens, action_tokens], dim=1)
+        x_fast_prefix = x_slow.detach() if self.action_detach_slow_prefix else x_slow
+        x_fast = torch.cat([x_fast_prefix, time_tokens, action_tokens], dim=1)
         suffix_valid_mask = torch.ones((B, 1 + action_tokens.shape[1]), device=device, dtype=torch.bool)
         fast_valid_mask = torch.cat([slow_valid_mask, suffix_valid_mask], dim=1)
         fast_rotary_info = self._build_action_rotary_batch_info(

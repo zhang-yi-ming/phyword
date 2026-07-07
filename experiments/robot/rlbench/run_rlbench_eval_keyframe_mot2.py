@@ -64,6 +64,10 @@ TASK_PROMPTS = {
     ),
 }
 
+SIM_TASK_NAME_ALIASES = {
+    "place_wine_at_rack_location": "stack_wine",
+}
+
 
 DEFAULT_PROMPT_SCHEDULE_PATH = str(Path(__file__).with_name("rlbench_keyframe_prompt_schedule.json"))
 DEFAULT_TRAIN_PROMPT_JSON_PATH = "/mnt/nas/zhangyiming/database/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json"
@@ -673,6 +677,10 @@ def env_action_from_model_action(model_action, obs_dict) -> np.ndarray:
 
 
 def close_rlbench_env(env, log_file):
+    if os.environ.get("RLBENCH_SKIP_ENV_CLOSE", "0").lower() in {"1", "true", "yes"}:
+        log_message("RLBench env close skipped by RLBENCH_SKIP_ENV_CLOSE", log_file)
+        return
+
     try:
         env.close()
     except Exception as exc:  # noqa: BLE001 - teardown should not hide eval results
@@ -694,8 +702,9 @@ def close_rlbench_env(env, log_file):
 def build_rlbench_env(cfg, task_name):
     action_mode = RLBenchActionMode.eepose_then_gripper_action_mode(absolute=True)
     obs_config = RLBenchObservationConfig.single_view_config(camera_name="front", image_size=(cfg.env_img_res, cfg.env_img_res))
+    sim_task_name = SIM_TASK_NAME_ALIASES.get(task_name, task_name)
     env = RLBenchEnv(
-        task_name=task_name,
+        task_name=sim_task_name,
         action_mode=action_mode,
         obs_config=obs_config,
         point_cloud_camera_names=["front"],
@@ -730,7 +739,7 @@ def log_failed_episodes(task_name, start_episode, num_episodes, log_file, reason
         log_message(f"Task {task_name} episode {failed_episode}: success=False", log_file)
 
 
-def run_task(cfg, task_name, model, processor, action_tokenizer, statistic, train_input_prompts, log_file):
+def run_task(cfg, task_name, model, processor, action_tokenizer, statistic, train_input_prompts, log_file, env=None):
     task_dir = os.path.join(cfg.result_dir, task_name)
     video_dir = os.path.join(task_dir, "videos")
     image_root = os.path.join(task_dir, "images")
@@ -751,7 +760,8 @@ def run_task(cfg, task_name, model, processor, action_tokenizer, statistic, trai
         transforms.CenterCrop((cfg.video_h, cfg.video_w)),
     ])
     successes = 0
-    env = build_rlbench_env_with_retries(cfg, task_name, log_file, "initial")
+    if env is None:
+        env = build_rlbench_env_with_retries(cfg, task_name, log_file, "initial")
 
     for episode in range(cfg.num_episodes):
         if env is None:
@@ -917,17 +927,32 @@ def main():
     log_message(f"=== Eval run start {time.strftime('%Y-%m-%d %H:%M:%S')} artifact={cfg.eval_artifact_name} ===", log_file)
     if cfg.bash_hparams_path and os.path.exists(cfg.bash_hparams_path):
         log_message(f"Bash hparams: {cfg.bash_hparams_path}", log_file)
-    model, processor, action_tokenizer, statistic = model_load(cfg)
     train_input_prompts = load_train_input_prompts(cfg.train_prompt_json_path)
     log_message(f"Loaded train input prompts: {cfg.train_prompt_json_path}", log_file)
     for task_name, prompt in sorted(train_input_prompts.items()):
         log_message(f"Train prompt task={task_name} prompt={prompt}", log_file)
     task_names = [task.strip() for task in cfg.task_names.split(",") if task.strip()]
+    prebuilt_envs = {}
+    for task_name in task_names:
+        prebuilt_envs[task_name] = build_rlbench_env_with_retries(cfg, task_name, log_file, "pre_model_load")
+        if prebuilt_envs[task_name] is None:
+            log_message(f"{task_name} pre_model_load env_build_failed; task will retry after model load", log_file)
+    model, processor, action_tokenizer, statistic = model_load(cfg)
     total_successes = 0
     total_episodes = 0
     summary = {}
     for task_name in task_names:
-        successes = run_task(cfg, task_name, model, processor, action_tokenizer, statistic, train_input_prompts, log_file)
+        successes = run_task(
+            cfg,
+            task_name,
+            model,
+            processor,
+            action_tokenizer,
+            statistic,
+            train_input_prompts,
+            log_file,
+            env=prebuilt_envs.pop(task_name, None),
+        )
         summary[task_name] = {"successes": successes, "episodes": cfg.num_episodes, "success_rate": successes / max(cfg.num_episodes, 1)}
         total_successes += successes
         total_episodes += cfg.num_episodes

@@ -18,7 +18,13 @@ import torch
 from torch import nn
 
 from cosmos_predict2._src.imaginaire.utils import log
-from cosmos_predict2._src.imaginaire.utils.fused_adam import FusedAdam
+try:
+    from cosmos_predict2._src.imaginaire.utils.fused_adam import FusedAdam
+except Exception as exc:
+    FusedAdam = None
+    _FUSED_ADAM_IMPORT_ERROR = exc
+else:
+    _FUSED_ADAM_IMPORT_ERROR = None
 
 
 def get_regular_param_group(net: nn.Module):
@@ -60,7 +66,11 @@ def get_base_optimizer(
     if optim_type == "adamw":
         opt_cls = torch.optim.AdamW
     elif optim_type == "fusedadam":
-        opt_cls = FusedAdam
+        if FusedAdam is None:
+            log.warning(f"FusedAdam unavailable, falling back to AdamW: {_FUSED_ADAM_IMPORT_ERROR}")
+            opt_cls = torch.optim.AdamW
+        else:
+            opt_cls = FusedAdam
     else:
         raise ValueError(f"Unknown optimizer type: {optim_type}")
 

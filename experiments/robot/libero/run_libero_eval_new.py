@@ -184,6 +184,7 @@ class GenerateConfig:
     control_freq: int = 0                           # LIBERO env control frequency (Hz)
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
+    task_ids: str = ""                               # Optional comma-separated task ids to evaluate
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                           # Resolution for environment images (not policy input resolution)
 
@@ -194,6 +195,7 @@ class GenerateConfig:
     local_log_dir: str = "../experiments/logs"        # Local directory for eval logs
     predicted_video_save_dir: str = ""               # If set, save each predicted Cosmos video to this directory
     rollout_video_save_dir: str = ""                 # If set, save rollout videos under this directory
+    disable_rollout_video: bool = False              # If true, skip rollout mp4 saving entirely
     value_visualization_dir: str = ""                # If set, save value traces and summary plots under this directory
     bash_hparams_path: str = ""                      # Optional shell-generated hparams file to copy into eval logs
     eval_artifact_name: str = ""                     # Shared date+runname stem for eval artifacts
@@ -732,6 +734,27 @@ def log_message(message: str, log_file=None):
     if log_file:
         log_file.write(message + "\n")
         log_file.flush()
+
+
+def parse_task_ids(task_ids: str, num_tasks: int) -> list[int]:
+    """Parse a comma-separated task id list, defaulting to all tasks."""
+    task_ids = str(task_ids or "").strip()
+    if not task_ids:
+        return list(range(num_tasks))
+
+    parsed: list[int] = []
+    for item in task_ids.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        task_id = int(item)
+        if task_id < 0 or task_id >= num_tasks:
+            raise ValueError(f"task id {task_id} is outside [0, {num_tasks}).")
+        parsed.append(task_id)
+
+    if not parsed:
+        raise ValueError("task_ids was provided but no valid ids were parsed.")
+    return parsed
 
 
 def _json_safe(value):
@@ -1556,17 +1579,19 @@ def run_task(
             task_successes += 1
             total_successes += 1
 
-        # Save replay video
-        save_rollout_video(
-            replay_images,
-            total_episodes,
-            success=success,
-            task_description=task_description,
-            log_file=log_file,
-            cosmos_denoise_steps=cfg.cosmos_denoise_steps,
-            rollout_dir=cfg.rollout_video_save_dir,
-            value_scores=replay_value_scores if (cfg.use_value_prediction or cfg.use_action_value_prediction) else None,
-        )
+        # Save replay video only when explicitly enabled. Long ep50 sweeps otherwise
+        # produce a large amount of I/O and increase render-process fragility.
+        if not getattr(cfg, "disable_rollout_video", False):
+            save_rollout_video(
+                replay_images,
+                total_episodes,
+                success=success,
+                task_description=task_description,
+                log_file=log_file,
+                cosmos_denoise_steps=cfg.cosmos_denoise_steps,
+                rollout_dir=cfg.rollout_video_save_dir,
+                value_scores=replay_value_scores if (cfg.use_value_prediction or cfg.use_action_value_prediction) else None,
+            )
 
         # Log results
         log_message(f"Success: {success}", log_file)
@@ -1615,11 +1640,13 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
     log_message(f"Cosmos denoise steps: {cfg.cosmos_denoise_steps}", log_file)
+    selected_task_ids = parse_task_ids(cfg.task_ids, num_tasks)
+    log_message(f"Selected task ids: {selected_task_ids}", log_file)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
     all_value_traces = []
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    for task_id in tqdm.tqdm(selected_task_ids):
         total_episodes, total_successes, all_value_traces = run_task(
             cfg,
             task_suite,

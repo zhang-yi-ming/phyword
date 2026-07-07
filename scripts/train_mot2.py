@@ -1099,6 +1099,11 @@ def train(args):
     accelerator.print("value_prediction=0")
     accelerator.print(f"state_latents_per_future={getattr(args, 'state_latents_per_future', 0)}")
     accelerator.print(f"bridge_pos_scheme={getattr(args, 'bridge_pos_scheme', 'mrope')}")
+    accelerator.print(f"action_detach_slow_prefix={int(bool(getattr(args, 'action_detach_slow_prefix', 0)))}")
+    accelerator.print(f"action_detach_video_branch={int(bool(getattr(args, 'action_detach_video_branch', 0)))}")
+    accelerator.print(
+        f"action_detach_slow_video_branch={int(bool(getattr(args, 'action_detach_slow_video_branch', 0)))}"
+    )
     accelerator.print(f"cosmos_janus_mot2_module={getattr(cosmos_janus_mot2_module, '__file__', 'N/A')}")
 
     accelerator.print("检查词表")
@@ -1225,16 +1230,18 @@ def train(args):
     use_pin_memory = bool(args.pin_memory)
     num_workers = max(int(args.num_workers), 0)
     use_persistent_workers = bool(args.persistent_workers) and num_workers > 0
-    train_dataloader = DataLoader(
-        train_dataset,
+    dataloader_kwargs = dict(
+        dataset=train_dataset,
         batch_size=args.train_bsz_per_gpu,
         shuffle=True,
         collate_fn=train_dataset.collate_fn,
         num_workers=num_workers,
         pin_memory=use_pin_memory,
         persistent_workers=use_persistent_workers,
-        prefetch_factor=4,
     )
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = max(int(args.prefetch_factor), 1)
+    train_dataloader = DataLoader(**dataloader_kwargs)
 
     world_size = int(getattr(accelerator, "num_processes", 1) or 1)
     if dist.is_available() and dist.is_initialized():
@@ -1457,6 +1464,8 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of DataLoader worker processes per training process.')
+    parser.add_argument('--prefetch_factor', type=int, default=4,
+                        help='Number of batches each DataLoader worker prefetches.')
     parser.add_argument('--pin_memory', type=int, default=1,
                         help='If 1, pin CPU batch memory before host-to-device transfer.')
     parser.add_argument('--persistent_workers', type=int, default=1,
@@ -1532,6 +1541,12 @@ if __name__ == '__main__':
     parser.add_argument('--bridge_pos_scheme', type=str, default='mrope',
                         choices=['mrope', 'mrope_interleave', 'llama1d', 'local', 'last0'],
                         help='Bridge rotary mode for latent/action QK. Use `mrope` for A1/Qwen3-VL-style multimodal 3D RoPE, `mrope_interleave` for THW-interleaved bridge basis, or `llama1d` for native Llama-style 1D RoPE. Legacy aliases `local` and `last0` normalize to `mrope`.')
+    parser.add_argument('--action_detach_slow_prefix', type=int, default=0,
+                        help='If 1, detach the slow 24-layer action prefix before appending time/action tokens for the fast action branch.')
+    parser.add_argument('--action_detach_video_branch', type=int, default=0,
+                        help='If 1, action-branch MoT attention reads detached video K/V so action loss cannot update the video branch.')
+    parser.add_argument('--action_detach_slow_video_branch', type=int, default=0,
+                        help='If 1, slow spatial CE/sim MoT attention reads detached video K/V so those losses cannot update the Cosmos video branch.')
 
 
 
@@ -1599,6 +1614,12 @@ if __name__ == '__main__':
         )
     if args.latent_hidden_wan_downsample_sim_loss_weight < 0:
         raise ValueError("latent_hidden_wan_downsample_sim_loss_weight must be non-negative.")
+    if args.action_detach_slow_prefix not in (0, 1):
+        raise ValueError("action_detach_slow_prefix must be 0 or 1.")
+    if args.action_detach_video_branch not in (0, 1):
+        raise ValueError("action_detach_video_branch must be 0 or 1.")
+    if args.action_detach_slow_video_branch not in (0, 1):
+        raise ValueError("action_detach_slow_video_branch must be 0 or 1.")
     args.log_dir = os.path.join(args.log_dir, args.run_name)
     args.output_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(args.log_dir, exist_ok=True)

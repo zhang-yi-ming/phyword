@@ -40,13 +40,14 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export WANDB_MODE="${WANDB_MODE:-online}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_janus_mot2_fis_rlbench_keyframe}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_janus_mot2_rlbench_keyframe}"
 RUN_NAME="${RUN_NAME:-cosmos2B_action1B_mot2_fis_rlbench_keyframe_spatial_v_new}"
 OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_action_fis_spatial_rlbench_keyframe}"
 
-DATA_JSON="${DATA_JSON:-${DATABASE_ROOT}/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"
+DATA_JSON="${DATA_JSON:-/mnt/amlfs-07/shared/physicalword/rlbench/train/json/train_action_chunk1_sumpos_lastrot_shared.json}"
 ACTION_EXPERT_PATH="${ACTION_EXPERT_PATH:-${PRETRAINED_ROOT}/LaST0_Pretrain_AE_chunk16/tfmr}"
 JANUS_INIT_MODE="${JANUS_INIT_MODE:-janus_pro_ae_flow}"
 JANUS_PRO_MODEL_PATH="${JANUS_PRO_MODEL_PATH:-${PRETRAINED_ROOT}/Janus-Pro-1B}"
@@ -59,7 +60,8 @@ TRAIN_BSZ="${TRAIN_BSZ:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 LR="${LR:-1e-4}"
 COSMOS_CORE_LR_RATIO="${COSMOS_CORE_LR_RATIO:-0.02}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-8}"
 
 VIDEO_FRAMES="${VIDEO_FRAMES:-9}"
 NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-5}"
@@ -95,10 +97,16 @@ SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_S
 WAN21_VAE_PATH="${WAN21_VAE_PATH:-${PRETRAINED_ROOT}/wan2.1_vae/original/Wan2.1_VAE.pth}"
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-1}"
 BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
+ACTION_DETACH_SLOW_PREFIX="${ACTION_DETACH_SLOW_PREFIX:-0}"
+ACTION_DETACH_VIDEO_BRANCH="${ACTION_DETACH_VIDEO_BRANCH:-0}"
+ACTION_DETACH_SLOW_VIDEO_BRANCH="${ACTION_DETACH_SLOW_VIDEO_BRANCH:-0}"
 
 echo ">>> Starting FiS 2-MoT RLBench keyframe training: ${RUN_NAME}"
 echo ">>> Spatial token mode: ${SPATIAL_TOKEN_MODE} count=${TOTAL_SPATIAL_TOKEN_COUNT}"
 echo ">>> Janus init mode: ${JANUS_INIT_MODE}"
+echo ">>> action_detach_slow_prefix=${ACTION_DETACH_SLOW_PREFIX}"
+echo ">>> action_detach_video_branch=${ACTION_DETACH_VIDEO_BRANCH}"
+echo ">>> action_detach_slow_video_branch=${ACTION_DETACH_SLOW_VIDEO_BRANCH}"
 
 accelerate launch --config_file ../config/sft.yaml \
   --num_processes "${NUM_PROCESSES}" \
@@ -127,6 +135,7 @@ accelerate launch --config_file ../config/sft.yaml \
   --save_freq "${SAVE_FREQ:-150}" \
   --train_bsz_per_gpu "${TRAIN_BSZ}" \
   --num_workers "${NUM_WORKERS}" \
+  --prefetch_factor "${PREFETCH_FACTOR}" \
   --pin_memory 1 \
   --persistent_workers 1 \
   --gradient_accumulation_steps "${GRAD_ACCUM}" \
@@ -148,6 +157,9 @@ accelerate launch --config_file ../config/sft.yaml \
   --latent_hidden_wan_downsample_sim_loss_weight "${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT}" \
   --wan21_vae_path "${WAN21_VAE_PATH}" \
   --bridge_pos_scheme "${BRIDGE_POS_SCHEME}" \
+  --action_detach_slow_prefix "${ACTION_DETACH_SLOW_PREFIX}" \
+  --action_detach_video_branch "${ACTION_DETACH_VIDEO_BRANCH}" \
+  --action_detach_slow_video_branch "${ACTION_DETACH_SLOW_VIDEO_BRANCH}" \
   --freeze_video_after "${FREEZE_VIDEO_AFTER:-300}" \
   --robot_state "${ROBOT_STATE}" \
   --state_placeholder_tokens "${STATE_PLACEHOLDER_TOKENS}" \

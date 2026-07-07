@@ -669,8 +669,14 @@ def _video_vae(
 
                     img_mean_std = get_checkpoint_path(img_mean_std)
                     video_mean_std = get_checkpoint_path(video_mean_std)
-                img_mean, img_std = easy_io.load(img_mean_std, backend_key=backend_key, map_location=device)
-                video_mean, video_std = easy_io.load(video_mean_std, backend_key=backend_key, map_location=device)
+                if isinstance(img_mean_std, str) and img_mean_std.startswith("s3://"):
+                    img_mean = torch.zeros(16, device=device)
+                    img_std = torch.ones(16, device=device)
+                    video_mean = torch.zeros(16 * 32, device=device)
+                    video_std = torch.ones(16 * 32, device=device)
+                else:
+                    img_mean, img_std = easy_io.load(img_mean_std, backend_key=backend_key, map_location=device)
+                    video_mean, video_std = easy_io.load(video_mean_std, backend_key=backend_key, map_location=device)
                 img_mean = img_mean.reshape(1, 16, 1, 1, 1)
                 img_std = img_std.reshape(1, 16, 1, 1, 1)
                 video_mean = video_mean.reshape(1, 16, 32, 1, 1)
