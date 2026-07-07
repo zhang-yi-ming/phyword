@@ -4,6 +4,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAST05_ROOT="${LAST05_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 LAST05_BETA_ROOT="${LAST05_BETA_ROOT:-$(cd "${LAST05_ROOT}/.." && pwd)}"
+REQUESTED_CONDA_ENV_NAME="${CONDA_ENV_NAME:-}"
+REQUESTED_CONDA_ENV_PATH="${CONDA_ENV_PATH:-}"
 
 for _last05_env in "${LAST05_LOCAL_ENV:-}" "${LAST05_BETA_ROOT}/last05_local_env.sh" "${LAST05_ROOT}/last05_local_env.sh"; do
   if [[ -n "${_last05_env}" && -f "${_last05_env}" ]]; then
@@ -17,8 +19,11 @@ DATABASE_ROOT="${DATABASE_ROOT:-/mnt/nas/zhangyiming/database}"
 PRETRAINED_ROOT="${PRETRAINED_ROOT:-${DATABASE_ROOT}/ckpt/pretrained}"
 REQUIRES_ROOT="${REQUIRES_ROOT:-/mnt/nas/zhangyiming/requires}"
 CONDA_BASE="${CONDA_BASE:-/root/miniconda3}"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-last05}"
-CONDA_ENV_PATH="${CONDA_ENV_PATH:-${CONDA_BASE}/envs/${CONDA_ENV_NAME}}"
+# This script should run in the in-place upgraded last05 env.  The shared
+# last05_local_env.sh defaults to last05_qwen3vl for other repos, so restore
+# the script-local default unless the caller explicitly provided an env.
+CONDA_ENV_NAME="${REQUESTED_CONDA_ENV_NAME:-last05}"
+CONDA_ENV_PATH="${REQUESTED_CONDA_ENV_PATH:-${CONDA_BASE}/envs/${CONDA_ENV_NAME}}"
 EXPERIMENTS_LIBERO_ROOT="${EXPERIMENTS_LIBERO_ROOT:-${LAST05_BETA_ROOT}/experiments}"
 EXPERIMENTS_RLBENCH_ROOT="${EXPERIMENTS_RLBENCH_ROOT:-${LAST05_BETA_ROOT}/experiments_rlbench}"
 COSMOS_ROOT="${COSMOS_ROOT:-/mnt/nas/zhangyiming/experiments}"
@@ -43,7 +48,7 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_trex_mot2_libero_spatial}"
-RUN_NAME="${RUN_NAME:-cosmos2B_trex2B_mot2_libero_spatial}"
+RUN_NAME="${RUN_NAME:-cosmos2B_trex2B_mot2_libero_spatial_0ce}"
 OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_trex_action_spatial}"
 
 DATA_JSON="${DATA_JSON:-${DATABASE_ROOT}/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/train_with_atomic_action.json}"
@@ -83,14 +88,14 @@ case "${SPATIAL_TOKEN_MODE}" in
     ;;
 esac
 
-DEFAULT_EXTRA_SPECIAL_TOKENS="</PAD>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
+DEFAULT_EXTRA_SPECIAL_TOKENS="</PAD>,</MOVE>,</PICK>,</PLACE>,</ROTATE>,</PULL>,</PUSH>,</NONE>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
 EXTRA_SPECIAL_TOKENS="${EXTRA_SPECIAL_TOKENS:-${DEFAULT_EXTRA_SPECIAL_TOKENS}}"
 
 VIDEO_LOSS_WEIGHT="${VIDEO_LOSS_WEIGHT:-1}"
-SPATIAL_LOSS_WEIGHT="${SPATIAL_LOSS_WEIGHT:-1.0}"
-USE_SPATIAL_HIDDEN_SIM_LOSS="${USE_SPATIAL_HIDDEN_SIM_LOSS:-1}"
+SPATIAL_LOSS_WEIGHT="${SPATIAL_LOSS_WEIGHT:-0}"
+USE_SPATIAL_HIDDEN_SIM_LOSS="${USE_SPATIAL_HIDDEN_SIM_LOSS:-0}"
 SPATIAL_HIDDEN_SIM_LOSS_MODE="${SPATIAL_HIDDEN_SIM_LOSS_MODE:-siglip}"
-SPATIAL_HIDDEN_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT:-1.0}"
+SPATIAL_HIDDEN_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT:-0}"
 USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS="${USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS:-0}"
 SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT:-1.0}"
 WAN21_VAE_PATH="${WAN21_VAE_PATH:-${PRETRAINED_ROOT}/wan2.1_vae/original/Wan2.1_VAE.pth}"
