@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from collections import deque
@@ -64,6 +65,29 @@ JANUS_ACTION_PROMPT_SUFFIX = (
     "Please refer to the current image and task instruction, predict the spatial token "
     "and output the action to execute now."
 )
+DEFAULT_SPECIAL_TOKEN_VOCAB = [
+    "</PAD>",
+    "</MOVE>",
+    "</PICK>",
+    "</PLACE>",
+    "</ROTATE>",
+    "</PULL>",
+    "</PUSH>",
+    "</NONE>",
+    "</box>",
+    "</broom>",
+    "</charger>",
+    "</frame>",
+    "</fridge>",
+    "</lamp>",
+    "</laptop>",
+    "</phone>",
+    "</toilet>",
+    "</umbrella>",
+    "</watering_can>",
+    "</wine>",
+]
+SPECIAL_TOKEN_VOCAB_FILENAME = "special_token_vocab.json"
 
 
 def build_janus_action_prompt_suffix(use_history_trajectory: bool) -> str:
@@ -158,6 +182,7 @@ class GenerateConfig:
     action_intermediate_size: int = 0                # If 0, infer slim MLP size from checkpoint; if >0, require an exact match
     model_variant: str = "mot2_action_spatial"      # This eval script builds the 2-MoT Cosmos + action-spatial model.
     total_latent_tokens: int = 1                     # Number of latent token CE tokens to generate at eval time
+    special_token_vocab: str = ",".join(DEFAULT_SPECIAL_TOKEN_VOCAB)  # Fallback independent spatial-token vocab
     img_latents_per_future: int = 0
     state_latents_per_future: int = 0
     num_future_frames: int = 0
@@ -226,6 +251,84 @@ def coerce_bool(value: Any) -> bool:
         if normalized in {"0", "false", "no", "n", "off"}:
             return False
     return bool(value)
+
+
+def parse_special_token_vocab(value) -> list[str]:
+    if value is None:
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB)
+    elif isinstance(value, str):
+        raw = value.strip()
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB) if not raw else [
+            part.strip() for part in (raw.split(",") if "," in raw else raw.split()) if part.strip()
+        ]
+    else:
+        tokens = [str(part).strip() for part in value if str(part).strip()]
+    if not tokens:
+        raise ValueError("special_token_vocab must not be empty.")
+    seen = set()
+    deduped = []
+    for token in tokens:
+        if token in seen:
+            raise ValueError(f"Duplicate special token in vocab: {token!r}")
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def load_special_token_vocab(checkpoint_dir: str, fallback) -> list[str]:
+    vocab_path = os.path.join(str(checkpoint_dir), SPECIAL_TOKEN_VOCAB_FILENAME) if checkpoint_dir else ""
+    if vocab_path and os.path.exists(vocab_path):
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            return parse_special_token_vocab(json.load(f))
+    return parse_special_token_vocab(fallback)
+
+
+def derive_special_token_source_words(token_text: str) -> list[str]:
+    chunks = re.findall(r"</([^>]+)>", str(token_text))
+    if not chunks or "".join(f"</{chunk}>" for chunk in chunks) != str(token_text):
+        raise ValueError(f"Cannot derive source words from special token {token_text!r}.")
+    source_words = []
+    for chunk in chunks:
+        source_words.extend(part for part in re.split(r"[^A-Za-z0-9]+", chunk.lower()) if part)
+    if not source_words:
+        raise ValueError(f"Cannot derive non-empty source words from special token {token_text!r}.")
+    return source_words
+
+
+def resolve_special_token_init_ids(tokenizer, special_token_vocab: list[str]) -> list[list[int]]:
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    all_source_ids = []
+    for token_text in special_token_vocab:
+        source_ids = []
+        for source_word in derive_special_token_source_words(token_text):
+            encoded = tokenizer.encode(source_word, add_special_tokens=False)
+            if not encoded:
+                raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to no tokens.")
+            for token_id in encoded:
+                token_id = int(token_id)
+                if unk_id is not None and token_id == int(unk_id) and source_word != getattr(tokenizer, "unk_token", None):
+                    raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to unk id {unk_id}.")
+                source_ids.append(token_id)
+        all_source_ids.append(source_ids)
+    return all_source_ids
+
+
+def validate_special_token_checkpoint_rows(state_dict: dict[str, Any], special_token_vocab: list[str]) -> None:
+    expected = len(special_token_vocab)
+    row_keys = [
+        "special_token_embedding.weight",
+        "special_token_lm_head.weight",
+    ]
+    missing = [key for key in row_keys if key not in state_dict]
+    if missing:
+        raise ValueError(f"Checkpoint is missing independent special-token weights: {missing}")
+    mismatches = []
+    for key in row_keys:
+        rows = int(state_dict[key].shape[0])
+        if rows != expected:
+            mismatches.append(f"{key}: checkpoint_rows={rows}, vocab_size={expected}")
+    if mismatches:
+        raise ValueError("Special-token vocab/checkpoint mismatch: " + ", ".join(mismatches))
 
 
 def get_video_latent_num_frames(video_tokenizer, pixel_frames: int) -> int:
@@ -401,7 +504,11 @@ def load_processor_for_checkpoint(model_path: str, checkpoint_dir: str):
     last_error = None
     for candidate in candidate_paths:
         try:
-            processor = VLChatProcessor.from_pretrained(candidate, trust_remote_code=True)
+            processor = VLChatProcessor.from_pretrained(
+                candidate,
+                trust_remote_code=True,
+                skip_output_special_tokens=True,
+            )
             if candidate != model_path:
                 logger.info("Loaded VLChatProcessor from %s", candidate)
             return processor
@@ -602,10 +709,6 @@ def model_load(cfg: Any):
     if cfg.janus_image_start_id is None or cfg.janus_image_end_id is None:
         raise ValueError("Could not resolve Janus image start/end token ids.")
 
-
-    cfg.latent_end_id = tokenizer.convert_tokens_to_ids("<|latent_end|>")
-
-
     # =================================================================
     # 2. 加载 Janus Action 骨架 (注意这里改为了 action_model_path)
     # =================================================================
@@ -648,12 +751,10 @@ def model_load(cfg: Any):
     print(f"Loading Fine-Tuned MoT Weights from {ckpt_path}...")
     
     state_dict = torch.load(ckpt_path, map_location="cpu")
-    validate_checkpoint_vocab_size(state_dict, tokenizer)
-    checkpoint_vocab_size = infer_checkpoint_vocab_size(state_dict)
-    ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size=checkpoint_vocab_size)
+    cfg.special_token_vocab = load_special_token_vocab(base_dir, getattr(cfg, "special_token_vocab", ""))
+    cfg.special_token_init_ids = resolve_special_token_init_ids(tokenizer, cfg.special_token_vocab)
+    validate_special_token_checkpoint_rows(state_dict, cfg.special_token_vocab)
     cfg.valid_token_vocab_size = int(len(tokenizer))
-    if checkpoint_vocab_size is not None:
-        cfg.checkpoint_vocab_size = int(checkpoint_vocab_size)
     log_resolved_inference_config(cfg)
 
     print("Building 2-MoT Cosmos + action-spatial Architecture...")

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import sys
 import time
@@ -75,6 +76,29 @@ JANUS_ACTION_PROMPT_SUFFIX = (
     "Please refer to the current image and task instruction, predict the spatial token "
     "and output the action to execute now."
 )
+DEFAULT_SPECIAL_TOKEN_VOCAB = [
+    "</PAD>",
+    "</MOVE>",
+    "</PICK>",
+    "</PLACE>",
+    "</ROTATE>",
+    "</PULL>",
+    "</PUSH>",
+    "</NONE>",
+    "</box>",
+    "</broom>",
+    "</charger>",
+    "</frame>",
+    "</fridge>",
+    "</lamp>",
+    "</laptop>",
+    "</phone>",
+    "</toilet>",
+    "</umbrella>",
+    "</watering_can>",
+    "</wine>",
+]
+SPECIAL_TOKEN_VOCAB_FILENAME = "special_token_vocab.json"
 
 
 @dataclass
@@ -106,6 +130,7 @@ class EvalConfig:
     state_dim: int = 7
     state_encoding_mode: str = "mlp"
     total_latent_tokens: int = 1
+    special_token_vocab: str = ",".join(DEFAULT_SPECIAL_TOKEN_VOCAB)
     img_latents_per_future: int = 0
     state_latents_per_future: int = 0
     num_future_frames: int = 0
@@ -138,6 +163,84 @@ def coerce_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def parse_special_token_vocab(value) -> list[str]:
+    if value is None:
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB)
+    elif isinstance(value, str):
+        raw = value.strip()
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB) if not raw else [
+            part.strip() for part in (raw.split(",") if "," in raw else raw.split()) if part.strip()
+        ]
+    else:
+        tokens = [str(part).strip() for part in value if str(part).strip()]
+    if not tokens:
+        raise ValueError("special_token_vocab must not be empty.")
+    seen = set()
+    deduped = []
+    for token in tokens:
+        if token in seen:
+            raise ValueError(f"Duplicate special token in vocab: {token!r}")
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def load_special_token_vocab(checkpoint_dir: str, fallback) -> list[str]:
+    vocab_path = os.path.join(str(checkpoint_dir), SPECIAL_TOKEN_VOCAB_FILENAME) if checkpoint_dir else ""
+    if vocab_path and os.path.exists(vocab_path):
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            return parse_special_token_vocab(json.load(f))
+    return parse_special_token_vocab(fallback)
+
+
+def derive_special_token_source_words(token_text: str) -> list[str]:
+    chunks = re.findall(r"</([^>]+)>", str(token_text))
+    if not chunks or "".join(f"</{chunk}>" for chunk in chunks) != str(token_text):
+        raise ValueError(f"Cannot derive source words from special token {token_text!r}.")
+    source_words = []
+    for chunk in chunks:
+        source_words.extend(part for part in re.split(r"[^A-Za-z0-9]+", chunk.lower()) if part)
+    if not source_words:
+        raise ValueError(f"Cannot derive non-empty source words from special token {token_text!r}.")
+    return source_words
+
+
+def resolve_special_token_init_ids(tokenizer, special_token_vocab: list[str]) -> list[list[int]]:
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    all_source_ids = []
+    for token_text in special_token_vocab:
+        source_ids = []
+        for source_word in derive_special_token_source_words(token_text):
+            encoded = tokenizer.encode(source_word, add_special_tokens=False)
+            if not encoded:
+                raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to no tokens.")
+            for token_id in encoded:
+                token_id = int(token_id)
+                if unk_id is not None and token_id == int(unk_id) and source_word != getattr(tokenizer, "unk_token", None):
+                    raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to unk id {unk_id}.")
+                source_ids.append(token_id)
+        all_source_ids.append(source_ids)
+    return all_source_ids
+
+
+def validate_special_token_checkpoint_rows(state_dict: dict[str, Any], special_token_vocab: list[str]) -> None:
+    expected = len(special_token_vocab)
+    row_keys = [
+        "special_token_embedding.weight",
+        "special_token_lm_head.weight",
+    ]
+    missing = [key for key in row_keys if key not in state_dict]
+    if missing:
+        raise ValueError(f"Checkpoint is missing independent special-token weights: {missing}")
+    mismatches = []
+    for key in row_keys:
+        rows = int(state_dict[key].shape[0])
+        if rows != expected:
+            mismatches.append(f"{key}: checkpoint_rows={rows}, vocab_size={expected}")
+    if mismatches:
+        raise ValueError("Special-token vocab/checkpoint mismatch: " + ", ".join(mismatches))
 
 
 def set_seed(seed: int) -> None:
@@ -258,7 +361,11 @@ def load_processor_for_checkpoint(model_path: str, checkpoint_dir: str):
     last_error = None
     for candidate in candidate_paths:
         try:
-            processor = VLChatProcessor.from_pretrained(candidate, trust_remote_code=True)
+            processor = VLChatProcessor.from_pretrained(
+                candidate,
+                trust_remote_code=True,
+                skip_output_special_tokens=True,
+            )
             if candidate != model_path:
                 logger.info("Loaded VLChatProcessor from %s", candidate)
             return processor
@@ -376,7 +483,6 @@ def model_load(cfg: EvalConfig):
     action_tokenizer = ActionTokenizer(tokenizer, need_to_sub=3)
     cfg.janus_image_start_id = getattr(processor, "image_start_id", None) or tokenizer.convert_tokens_to_ids("<begin_of_image>")
     cfg.janus_image_end_id = getattr(processor, "image_end_id", None) or tokenizer.convert_tokens_to_ids("<end_of_image>")
-    cfg.latent_end_id = tokenizer.convert_tokens_to_ids("<|latent_end|>")
 
     janus_model = AutoModelForCausalLM.from_pretrained(
         cfg.action_model_path,
@@ -405,12 +511,10 @@ def model_load(cfg: EvalConfig):
     resolve_video_condition_config(cfg, cosmos_wrapper.tokenizer)
 
     state_dict = torch.load(ckpt_path, map_location="cpu")
-    validate_checkpoint_vocab_size(state_dict, tokenizer)
-    checkpoint_vocab_size = infer_checkpoint_vocab_size(state_dict)
-    ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size=checkpoint_vocab_size)
+    cfg.special_token_vocab = load_special_token_vocab(base_dir, getattr(cfg, "special_token_vocab", ""))
+    cfg.special_token_init_ids = resolve_special_token_init_ids(tokenizer, cfg.special_token_vocab)
+    validate_special_token_checkpoint_rows(state_dict, cfg.special_token_vocab)
     cfg.valid_token_vocab_size = int(len(tokenizer))
-    if checkpoint_vocab_size is not None:
-        cfg.checkpoint_vocab_size = int(checkpoint_vocab_size)
     model = CosmosJanusActionSpatialMoT2Expert(cosmos_wrapper.net, cosmos_wrapper.tokenizer, janus_model, cfg)
     model.set_cosmos_inference_runtime_from_wrapper(cosmos_wrapper)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)

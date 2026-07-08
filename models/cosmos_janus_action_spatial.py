@@ -11,7 +11,7 @@ layers.  The final action tokens are appended only for the fast AE layers and
 supervised with flow matching.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 import math
 import types
 import copy
@@ -19,6 +19,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.models.vision_transformer import Mlp
 
 from janus.diffusion import ActionEmbedder
 from vae.stacked_resample import StackedDownsample2d, StackedUpsample2d
@@ -506,6 +507,15 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 "spatial_hidden_sim_loss_mode must be 'siglip' or 'wan_vae', "
                 f"got {self.spatial_hidden_sim_loss_mode!r}."
             )
+        self.spatial_hidden_sim_pool_mode = str(
+            getattr(config, "spatial_hidden_sim_pool_mode", getattr(config, "latent_hidden_sim_pool_mode", "pool"))
+        ).lower()
+        if self.spatial_hidden_sim_pool_mode not in ("pool", "one_mlp", "mlp"):
+            raise ValueError(
+                "spatial_hidden_sim_pool_mode must be 'pool', 'one_mlp', or 'mlp', "
+                f"got {self.spatial_hidden_sim_pool_mode!r}."
+            )
+        setattr(self.config, "spatial_hidden_sim_pool_mode", self.spatial_hidden_sim_pool_mode)
         self.use_spatial_hidden_wan_downsample_sim_loss = bool(
             getattr(
                 config,
@@ -523,6 +533,14 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         if self.bridge_pos_scheme == "llama1d" and self.janus_rotary_emb is None:
             raise ValueError("bridge_pos_scheme='llama1d' requires janus.language_model.model.rotary_emb.")
 
+        self.special_token_vocab = list(getattr(config, "special_token_vocab", []) or [])
+        if not self.special_token_vocab:
+            raise ValueError("config.special_token_vocab must be provided for independent spatial token training.")
+        setattr(self.config, "special_token_vocab", list(self.special_token_vocab))
+        self.special_token_embedding = nn.Embedding(len(self.special_token_vocab), self.janus_dim).to(self.dtype)
+        self.special_token_lm_head = nn.Linear(self.janus_dim, len(self.special_token_vocab), bias=False).to(self.dtype)
+        self._init_special_token_modules(getattr(config, "special_token_init_ids", None))
+
         self.num_cond_input_frames = max(1, int(getattr(config, "num_cond_input_frames", 1) or 1))
         self.num_cond_latent_frames = max(1, int(getattr(config, "num_cond_latent_frames", 1) or 1))
         setattr(self.config, "num_cond_input_frames", self.num_cond_input_frames)
@@ -530,6 +548,22 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
 
         self.state_mlp_embedder = ActionEmbedder(action_size=self.state_dim, hidden_size=self.janus_dim)
         self._init_state_mlp_embedder()
+        self.spatial_hidden_sim_score_mlps = nn.ModuleList()
+        self.spatial_hidden_sim_proj_mlps = nn.ModuleList()
+        if (
+            self.use_spatial_hidden_sim_loss
+            and self.spatial_hidden_sim_loss_mode == "siglip"
+            and self.spatial_hidden_sim_pool_mode != "pool"
+        ):
+            mlp_count = 1 if self.spatial_hidden_sim_pool_mode == "one_mlp" else self._resolve_spatial_token_count(
+                getattr(config, "total_spatial_tokens", getattr(config, "total_latent_tokens", 1))
+            )
+            self.spatial_hidden_sim_score_mlps = nn.ModuleList(
+                [self._make_spatial_hidden_sim_mlp(self.janus_dim, 1) for _ in range(mlp_count)]
+            )
+            self.spatial_hidden_sim_proj_mlps = nn.ModuleList(
+                [self._make_spatial_hidden_sim_mlp(self.janus_dim, self.janus_dim) for _ in range(mlp_count)]
+            )
 
         self.spatial_hidden_wan_upsampler = None
         if self.use_spatial_hidden_sim_loss and self.spatial_hidden_sim_loss_mode == "wan_vae":
@@ -676,6 +710,57 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         nn.init.normal_(self.state_mlp_embedder.mlp.fc2.weight, std=0.02)
         nn.init.constant_(self.state_mlp_embedder.mlp.fc1.bias, 0)
         nn.init.constant_(self.state_mlp_embedder.mlp.fc2.bias, 0)
+
+    def _make_spatial_hidden_sim_mlp(self, in_features: int, out_features: int) -> nn.Module:
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        return Mlp(
+            in_features=int(in_features),
+            hidden_features=self.janus_dim,
+            out_features=int(out_features),
+            act_layer=approx_gelu,
+            drop=0,
+        ).to(self.dtype)
+
+    def _init_special_token_modules(self, source_ids_by_token: Optional[Sequence[Sequence[int]]]):
+        if source_ids_by_token is None:
+            raise ValueError("config.special_token_init_ids must be provided for special token initialization.")
+        if len(source_ids_by_token) != len(self.special_token_vocab):
+            raise ValueError(
+                "special_token_init_ids length must match special_token_vocab length: "
+                f"{len(source_ids_by_token)} != {len(self.special_token_vocab)}."
+            )
+        base_embed = self.janus.language_model.model.embed_tokens.weight
+        base_lm_head = getattr(self.janus.language_model, "lm_head", None)
+        base_lm_head_weight = None if base_lm_head is None else getattr(base_lm_head, "weight", None)
+        with torch.no_grad():
+            for row_idx, (token_text, source_ids) in enumerate(zip(self.special_token_vocab, source_ids_by_token)):
+                ids = [int(token_id) for token_id in source_ids]
+                if not ids:
+                    raise ValueError(f"Special token {token_text!r} has no source token ids.")
+                if min(ids) < 0 or max(ids) >= int(base_embed.shape[0]):
+                    raise ValueError(
+                        f"Source ids for {token_text!r} exceed base embedding rows: "
+                        f"ids={ids}, rows={int(base_embed.shape[0])}."
+                    )
+                embed_ids = torch.tensor(ids, device=base_embed.device, dtype=torch.long)
+                embed_init = base_embed.index_select(0, embed_ids).mean(dim=0)
+                self.special_token_embedding.weight[row_idx].copy_(
+                    embed_init.to(device=self.special_token_embedding.weight.device, dtype=self.special_token_embedding.weight.dtype)
+                )
+
+                if base_lm_head_weight is not None:
+                    if max(ids) >= int(base_lm_head_weight.shape[0]):
+                        raise ValueError(
+                            f"Source ids for {token_text!r} exceed base lm_head rows: "
+                            f"ids={ids}, rows={int(base_lm_head_weight.shape[0])}."
+                        )
+                    head_ids = torch.tensor(ids, device=base_lm_head_weight.device, dtype=torch.long)
+                    head_init = base_lm_head_weight.index_select(0, head_ids).mean(dim=0)
+                else:
+                    head_init = embed_init
+                self.special_token_lm_head.weight[row_idx].copy_(
+                    head_init.to(device=self.special_token_lm_head.weight.device, dtype=self.special_token_lm_head.weight.dtype)
+                )
 
     def _bridge_parameter_ids(self):
         ids = set()
@@ -901,6 +986,20 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         safe_ids[safe_ids < 0] = 0
         return self.janus.language_model.model.embed_tokens(safe_ids)
 
+    def _embed_special_token_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if input_ids.numel() > 0:
+            min_id = int(input_ids.min().item())
+            max_id = int(input_ids.max().item())
+            if min_id < 0 or max_id >= len(self.special_token_vocab):
+                raise ValueError(
+                    f"Special token ids must be in [0, {len(self.special_token_vocab) - 1}], "
+                    f"got min={min_id}, max={max_id}."
+                )
+        return self.special_token_embedding(input_ids)
+
+    def _special_token_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.special_token_lm_head(hidden_states)
+
     def _janus_vision_dtype(self) -> torch.dtype:
         try:
             return next(self.janus.vision_model.parameters()).dtype
@@ -914,6 +1013,49 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         flat = pixel_values.reshape(B * N, *pixel_values.shape[2:]).to(dtype=self._janus_vision_dtype())
         image_embeds = self.janus.aligner(self.janus.vision_model(flat))
         return image_embeds.reshape(B, N, image_embeds.shape[1], image_embeds.shape[2])
+
+    def _build_spatial_hidden_siglip_targets(
+        self,
+        future_pixel_values: torch.Tensor,
+        batch_size: int,
+        spatial_token_count: int,
+        hidden_dim: int,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            siglip_tokens = self._encode_janus_pixel_values(future_pixel_values)
+        if siglip_tokens.ndim != 4 or siglip_tokens.shape[0] != batch_size or siglip_tokens.shape[1] != 1:
+            raise ValueError(
+                "SigLIP hidden sim expects encoded future image tokens shaped [B, 1, T, D], "
+                f"got {tuple(siglip_tokens.shape)}."
+            )
+        siglip_tokens = siglip_tokens[:, 0, :, :].to(dtype=self.dtype)
+        if siglip_tokens.shape[-1] != hidden_dim:
+            raise ValueError(
+                f"SigLIP token dim must match spatial hidden dim {hidden_dim}, got {siglip_tokens.shape[-1]}."
+            )
+
+        if self.spatial_hidden_sim_pool_mode == "pool":
+            pooled = siglip_tokens.mean(dim=1)
+            return pooled[:, None, :].expand(batch_size, spatial_token_count, hidden_dim)
+
+        if len(self.spatial_hidden_sim_score_mlps) == 0 or len(self.spatial_hidden_sim_proj_mlps) == 0:
+            raise RuntimeError(
+                f"spatial_hidden_sim_pool_mode={self.spatial_hidden_sim_pool_mode!r} requires initialized MLP modules."
+            )
+        if self.spatial_hidden_sim_pool_mode == "mlp" and spatial_token_count > len(self.spatial_hidden_sim_score_mlps):
+            raise ValueError(
+                f"Need {spatial_token_count} per-token SigLIP pooling MLPs, "
+                f"but only {len(self.spatial_hidden_sim_score_mlps)} were initialized."
+            )
+
+        targets = []
+        for token_idx in range(spatial_token_count):
+            mlp_idx = 0 if self.spatial_hidden_sim_pool_mode == "one_mlp" else token_idx
+            scores = self.spatial_hidden_sim_score_mlps[mlp_idx](siglip_tokens).squeeze(-1)
+            weights = torch.softmax(scores.to(torch.float32), dim=1).to(dtype=siglip_tokens.dtype)
+            pooled = torch.sum(siglip_tokens * weights.unsqueeze(-1), dim=1)
+            targets.append(self.spatial_hidden_sim_proj_mlps[mlp_idx](pooled))
+        return torch.stack(targets, dim=1)
 
     def encode_state_values(self, state_values: torch.Tensor) -> torch.Tensor:
         if state_values.ndim not in (2, 3):
@@ -1541,11 +1683,9 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             else:
                 anchor_idx = torch.full((B,), context_embeds.shape[1] + prev.shape[1] - 1, device=device, dtype=torch.long)
             anchor_hidden = hidden_norm[torch.arange(B, device=device), anchor_idx]
-            logits = self.janus.language_model.lm_head(anchor_hidden)
-            if self.valid_token_vocab_size is not None and self.valid_token_vocab_size < logits.shape[-1]:
-                logits = logits[..., :self.valid_token_vocab_size]
+            logits = self._special_token_logits(anchor_hidden)
             token_ids = logits.argmax(dim=-1)
-            spatial_parts.append(self._embed_janus_token_ids(token_ids.unsqueeze(1)).to(self.dtype))
+            spatial_parts.append(self._embed_special_token_ids(token_ids.unsqueeze(1)).to(self.dtype))
             last_anchor_hidden = anchor_hidden
             last_token_ids = token_ids
 
@@ -1608,11 +1748,9 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         last_token_ids = None
         for _ in range(num_spatial_tokens):
             last_prediction_anchor_hidden = last_anchor_hidden
-            logits = self.janus.language_model.lm_head(last_anchor_hidden)
-            if self.valid_token_vocab_size is not None and self.valid_token_vocab_size < logits.shape[-1]:
-                logits = logits[..., :self.valid_token_vocab_size]
+            logits = self._special_token_logits(last_anchor_hidden)
             token_ids = logits.argmax(dim=-1)
-            token_embeds = self._embed_janus_token_ids(token_ids.unsqueeze(1)).to(self.dtype)
+            token_embeds = self._embed_special_token_ids(token_ids.unsqueeze(1)).to(self.dtype)
             spatial_parts.append(token_embeds)
             last_token_ids = token_ids
 
@@ -2017,7 +2155,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         target_video_v = video_noise - clean_video_latent
         target_video_v[:, :, :n_cond] = 0.0
         target_action_v = action_noise - actions
-        spatial_gt_embeds = self._embed_janus_token_ids(spatial_gt_token_ids).to(self.dtype)
+        spatial_gt_embeds = self._embed_special_token_ids(spatial_gt_token_ids).to(self.dtype)
 
         self._clear_cached_video_kv()
         try:
@@ -2062,7 +2200,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 loss_video = F.mse_loss(pred_video_v[:, :, n_cond:], target_video_v[:, :, n_cond:])
             loss_action = F.mse_loss(pred_action_v, target_action_v)
 
-            spatial_logits = self.janus.language_model.lm_head(spatial_anchor_hiddens)
+            spatial_logits = self._special_token_logits(spatial_anchor_hiddens)
             spatial_ce_per_item = F.cross_entropy(
                 spatial_logits.reshape(B * spatial_token_count, -1).to(torch.float32),
                 spatial_gt_token_ids.reshape(B * spatial_token_count),
@@ -2115,12 +2253,11 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                             "spatial_hidden_sim_pixel_values must have shape [B, 1, C, H, W], "
                             f"got {tuple(spatial_hidden_sim_pixel_values.shape)}."
                         )
-                    with torch.no_grad():
-                        sim_target = self._encode_janus_pixel_values(spatial_hidden_sim_pixel_values).mean(dim=2)
-                    sim_target = sim_target[:, 0, :][:, None, :].expand(
-                        B,
-                        spatial_token_count,
-                        spatial_anchor_hiddens.shape[-1],
+                    sim_target = self._build_spatial_hidden_siglip_targets(
+                        future_pixel_values=spatial_hidden_sim_pixel_values,
+                        batch_size=B,
+                        spatial_token_count=spatial_token_count,
+                        hidden_dim=spatial_anchor_hiddens.shape[-1],
                     )
                     similarity = F.cosine_similarity(
                         spatial_anchor_hiddens.to(torch.float32),

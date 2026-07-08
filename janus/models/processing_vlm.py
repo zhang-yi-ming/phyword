@@ -165,6 +165,7 @@ class VLChatProcessor(ProcessorMixin):
         **kwargs,
     ):
         extra_special_tokens = _normalize_extra_special_tokens(kwargs.pop("extra_special_tokens", None))
+        skip_output_special_tokens = bool(kwargs.pop("skip_output_special_tokens", False))
         '''
         print("VLChatProcessor init")
         print("image_processor: ", image_processor)
@@ -187,22 +188,31 @@ class VLChatProcessor(ProcessorMixin):
         special_tokens = []
         image_id = self.tokenizer.vocab.get(image_tag)
         if image_id is None:
+            if skip_output_special_tokens:
+                raise ValueError(
+                    f"{image_tag!r} is missing from the base tokenizer and "
+                    "skip_output_special_tokens=True forbids tokenizer expansion."
+                )
             special_tokens = [image_tag]
-        special_tokens.extend(["<|latent_start|>", "<|latent_pad|>", "<|latent_end|>"])
-        if image_id is not None:
-            special_tokens.append(f'</MOVE>')
-            special_tokens.append(f'</PICK>')
-            special_tokens.append(f'</PLACE>')
-            special_tokens.append(f'</ROTATE>')
-            special_tokens.append(f'</PULL>')
-            special_tokens.append(f'</PUSH>')
-            special_tokens.append(f'</NONE>')
+        if not skip_output_special_tokens:
+            special_tokens.extend(["<|latent_start|>", "<|latent_pad|>", "<|latent_end|>"])
+            if image_id is not None:
+                special_tokens.append(f'</MOVE>')
+                special_tokens.append(f'</PICK>')
+                special_tokens.append(f'</PLACE>')
+                special_tokens.append(f'</ROTATE>')
+                special_tokens.append(f'</PULL>')
+                special_tokens.append(f'</PUSH>')
+                special_tokens.append(f'</NONE>')
 
         existing_special_tokens = set(special_tokens)
-        self.extra_special_tokens = _filter_extra_special_tokens(
-            extra_special_tokens,
-            existing_special_tokens=existing_special_tokens,
-        )
+        if skip_output_special_tokens:
+            self.extra_special_tokens = []
+        else:
+            self.extra_special_tokens = _filter_extra_special_tokens(
+                extra_special_tokens,
+                existing_special_tokens=existing_special_tokens,
+            )
         special_tokens.extend(self.extra_special_tokens)
         special_tokens = _dedupe_preserve_order(special_tokens)
         #print("special_tokens: ", special_tokens)
@@ -220,6 +230,7 @@ class VLChatProcessor(ProcessorMixin):
         self.sft_format = sft_format
         self.mask_prompt = mask_prompt
         self.ignore_id = ignore_id
+        self.skip_output_special_tokens = skip_output_special_tokens
 
         super().__init__(
             image_processor,
@@ -262,13 +273,24 @@ class VLChatProcessor(ProcessorMixin):
         # input("tokenizer check done, press any key to continue")
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, extra_special_tokens=None, **kwargs):
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path,
+        *args,
+        extra_special_tokens=None,
+        skip_output_special_tokens=False,
+        **kwargs,
+    ):
+        if skip_output_special_tokens:
+            kwargs["skip_output_special_tokens"] = True
         processor = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        if extra_special_tokens is not None:
+        if extra_special_tokens is not None and not skip_output_special_tokens:
             processor.add_extra_special_tokens(extra_special_tokens)
         return processor
 
     def add_extra_special_tokens(self, extra_special_tokens):
+        if getattr(self, "skip_output_special_tokens", False):
+            return []
         base_special_tokens = [
             "<|latent_start|>",
             "<|latent_pad|>",

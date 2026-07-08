@@ -63,6 +63,8 @@ COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-${PRETRAINED_ROOT}/Cosmos-Predict2.5-2B/
 COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-${DATABASE_ROOT}/rlbench/train/json/cosmos_text_cache_rlbench_keyframe}"
 TRAIN_PROMPT_JSON_PATH="${TRAIN_PROMPT_JSON_PATH:-${DATABASE_ROOT}/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"
+DEFAULT_SPECIAL_TOKEN_VOCAB="</PAD>,</MOVE>,</PICK>,</PLACE>,</ROTATE>,</PULL>,</PUSH>,</NONE>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
+SPECIAL_TOKEN_VOCAB="${SPECIAL_TOKEN_VOCAB:-${DEFAULT_SPECIAL_TOKEN_VOCAB}}"
 
 DEFAULT_TASK_NAMES="close_box,close_laptop_lid,sweep_to_dustpan,phone_on_base,toilet_seat_down,close_fridge,place_wine_at_rack_location,water_plants,take_umbrella_out_of_umbrella_stand,take_frame_off_hanger"
 TASK_IDS="${TASK_IDS:-0}"
@@ -162,7 +164,7 @@ trap 'rc=$?; echo "[ERROR] test_rlbench_keyframe_2expert.sh failed with exit cod
 {
   for key in LAST05_ROOT EXPERIMENTS_ROOT OUTPUT_ROOT_DIR RUN_NAME RUN_DIR CHECKPOINT_NAME PRETRAINED_CHECKPOINT \
     EVAL_ARTIFACT_NAME RESULT_DIR JANUS_MODEL_PATH ACTION_MODEL_PATH COSMOS_MODEL_PATH COSMOS_EXPERIMENT_NAME COSMOS_TEXT_CACHE_PATH \
-    TRAIN_PROMPT_JSON_PATH DEFAULT_TASK_NAMES TASK_IDS TASK_NAMES NUM_EPISODES MAX_KEYFRAME_CHUNKS MAX_STEPS CUDA_DEVICE SEED ACTION_DIM ACTION_CHUNK VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES ENV_IMG_RES \
+    TRAIN_PROMPT_JSON_PATH SPECIAL_TOKEN_VOCAB DEFAULT_TASK_NAMES TASK_IDS TASK_NAMES NUM_EPISODES MAX_KEYFRAME_CHUNKS MAX_STEPS CUDA_DEVICE SEED ACTION_DIM ACTION_CHUNK VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES ENV_IMG_RES \
     TOTAL_LATENT_TOKENS IMG_LATENTS_PER_FUTURE STATE_LATENTS_PER_FUTURE NUM_FUTURE_FRAMES FUTURE_FRAME_STRIDE \
     ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_DIM STATE_ENCODING_MODE \
     BRIDGE_POS_SCHEME ACTION_DENOISE_STEPS COSMOS_DENOISE_STEPS \
@@ -287,6 +289,7 @@ python -u "$LAST05_ROOT/experiments/robot/rlbench/run_rlbench_eval_keyframe_mot2
   --num_cond_input_frames "$NUM_COND_INPUT_FRAMES" \
   --env_img_res "$ENV_IMG_RES" \
   --total_latent_tokens "$TOTAL_LATENT_TOKENS" \
+  --special_token_vocab "$SPECIAL_TOKEN_VOCAB" \
   --img_latents_per_future "$IMG_LATENTS_PER_FUTURE" \
   --state_latents_per_future "$STATE_LATENTS_PER_FUTURE" \
   --num_future_frames "$NUM_FUTURE_FRAMES" \

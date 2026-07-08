@@ -63,6 +63,88 @@ LATENT_TOKEN_MODE_ALIASES = {
     "1": "v",
     "2": "vn",
 }
+DEFAULT_SPECIAL_TOKEN_VOCAB = [
+    "</PAD>",
+    "</MOVE>",
+    "</PICK>",
+    "</PLACE>",
+    "</ROTATE>",
+    "</PULL>",
+    "</PUSH>",
+    "</NONE>",
+    "</box>",
+    "</broom>",
+    "</charger>",
+    "</frame>",
+    "</fridge>",
+    "</lamp>",
+    "</laptop>",
+    "</phone>",
+    "</toilet>",
+    "</umbrella>",
+    "</watering_can>",
+    "</wine>",
+]
+SPECIAL_TOKEN_VOCAB_FILENAME = "special_token_vocab.json"
+
+
+def parse_special_token_vocab(value) -> List[str]:
+    if value is None:
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB)
+    elif isinstance(value, str):
+        raw = value.strip()
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB) if not raw else [
+            part.strip() for part in (raw.split(",") if "," in raw else raw.split()) if part.strip()
+        ]
+    else:
+        tokens = [str(part).strip() for part in value if str(part).strip()]
+    if not tokens:
+        raise ValueError("special_token_vocab must not be empty.")
+    seen = set()
+    deduped = []
+    for token in tokens:
+        if token in seen:
+            raise ValueError(f"Duplicate special token in vocab: {token!r}")
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def derive_special_token_source_words(token_text: str) -> List[str]:
+    chunks = re.findall(r"</([^>]+)>", str(token_text))
+    if not chunks or "".join(f"</{chunk}>" for chunk in chunks) != str(token_text):
+        raise ValueError(f"Cannot derive source words from special token {token_text!r}.")
+    source_words = []
+    for chunk in chunks:
+        source_words.extend(part for part in re.split(r"[^A-Za-z0-9]+", chunk.lower()) if part)
+    if not source_words:
+        raise ValueError(f"Cannot derive non-empty source words from special token {token_text!r}.")
+    return source_words
+
+
+def resolve_special_token_init_ids(tokenizer, special_token_vocab: List[str]) -> List[List[int]]:
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    all_source_ids = []
+    for token_text in special_token_vocab:
+        source_ids = []
+        for source_word in derive_special_token_source_words(token_text):
+            encoded = tokenizer.encode(source_word, add_special_tokens=False)
+            if not encoded:
+                raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to no tokens.")
+            for token_id in encoded:
+                token_id = int(token_id)
+                if unk_id is not None and token_id == int(unk_id) and source_word != getattr(tokenizer, "unk_token", None):
+                    raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to unk id {unk_id}.")
+                source_ids.append(token_id)
+        all_source_ids.append(source_ids)
+    return all_source_ids
+
+
+def resolve_special_token_vocab_args(args):
+    vocab = parse_special_token_vocab(getattr(args, "special_token_vocab", None))
+    args.special_token_vocab = vocab
+    args.special_token_to_id = {token: idx for idx, token in enumerate(vocab)}
+    return args
 
 JANUS_ACTION_PROMPT_SUFFIX = (
     "Please refer to the current image and task instruction, predict the spatial token "
@@ -471,23 +553,15 @@ class VLACotDataset(Dataset):
         if field_name not in sample:
             raise KeyError(f"Dataset sample index={index} is missing required '{field_name}' field.")
         gt_text = str(sample[field_name])
-        token_ids = self.tokenizer.encode(gt_text, add_special_tokens=False)
-        if len(token_ids) != 1:
+        token_to_id = getattr(self.config, "special_token_to_id", None)
+        if token_to_id is None:
+            raise ValueError("config.special_token_to_id is required for spatial token labels.")
+        if gt_text not in token_to_id:
             raise ValueError(
-                f"Dataset sample index={index} {field_name}={gt_text!r} must encode to exactly "
-                f"one tokenizer id, got {len(token_ids)} ids: {token_ids}."
+                f"Dataset sample index={index} {field_name}={gt_text!r} is not in special_token_vocab. "
+                f"Known tokens: {getattr(self.config, 'special_token_vocab', [])}"
             )
-        token_id = int(token_ids[0])
-        unk_id = getattr(self.tokenizer, "unk_token_id", None)
-        if (
-            unk_id is not None
-            and token_id == int(unk_id)
-            and gt_text != getattr(self.tokenizer, "unk_token", None)
-        ):
-            raise ValueError(
-                f"Dataset sample index={index} {field_name}={gt_text!r} encoded to unk token id {unk_id}."
-            )
-        return torch.tensor(token_id, dtype=torch.long)
+        return torch.tensor(int(token_to_id[gt_text]), dtype=torch.long)
 
     def _encode_gt_latent_tokens(self, sample, index):
         token_count = self._latent_token_count()
@@ -860,6 +934,8 @@ def save_checkpoint(model, processor, accelerator, args, epoch, global_step, sta
         if stats_data is not None:
             with open(os.path.join(save_dir, 'train_statistics.json'), 'w') as f:
                 json.dump(stats_data, f, indent=2)
+        with open(os.path.join(save_dir, SPECIAL_TOKEN_VOCAB_FILENAME), 'w') as f:
+            json.dump(list(args.special_token_vocab), f, indent=2)
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -903,10 +979,14 @@ def train(args):
         raise ValueError("--janus_pro_model_path is required when --janus_init_mode=janus_pro_ae_flow.")
 
     processor_path = args.janus_pro_model_path if janus_init_mode == "janus_pro_ae_flow" else args.action_expert_path
-    processor = VLChatProcessor.from_pretrained(processor_path, trust_remote_code=True)
-    added_extra_special_tokens = processor.add_extra_special_tokens(args.extra_special_tokens)
-    accelerator.print(f"extra_special_tokens={getattr(processor, 'extra_special_tokens', [])}")
-    accelerator.print(f"added_extra_special_tokens={added_extra_special_tokens}")
+    processor = VLChatProcessor.from_pretrained(
+        processor_path,
+        trust_remote_code=True,
+        skip_output_special_tokens=True,
+    )
+    args.special_token_init_ids = resolve_special_token_init_ids(processor.tokenizer, args.special_token_vocab)
+    accelerator.print(f"special_token_vocab={args.special_token_vocab}")
+    accelerator.print(f"special_token_vocab_size={len(args.special_token_vocab)}")
 
     # ----------------------------------------------------------------
     # Load Janus.  Legacy mode keeps the exact AE-only behavior.  The optional
@@ -989,8 +1069,7 @@ def train(args):
             "Initialized AE flow components into Janus-Pro base while keeping Janus-Pro "
             f"tokenizer/embed_tokens/lm_head. copied_keys={len(copied_flow_keys)}"
         )
-    ensure_janus_tokenizer_alignment(janus_model, processor.tokenizer, accelerator)
-    initialize_action_special_token_rows(janus_model, processor.tokenizer, accelerator)
+    accelerator.print("Keeping base Janus tokenizer/embed_tokens/lm_head unexpanded for independent spatial vocab.")
 
     # ----------------------------------------------------------------
     # Load Cosmos
@@ -1024,19 +1103,6 @@ def train(args):
         args.janus_image_end_id = processor.tokenizer.convert_tokens_to_ids("<end_of_image>")
     if args.janus_image_start_id is None or args.janus_image_end_id is None:
         raise ValueError("Could not resolve Janus image start/end token ids.")
-    args.latent_end_id = processor.tokenizer.convert_tokens_to_ids("<|latent_end|>")
-    tokenizer_unk_id = processor.tokenizer.unk_token_id
-    if (
-        args.latent_end_id is None
-        or args.latent_end_id < 0
-        or (
-            tokenizer_unk_id is not None
-            and args.latent_end_id == tokenizer_unk_id
-            and processor.tokenizer.unk_token != "<|latent_end|>"
-        )
-    ):
-        raise ValueError("Could not resolve Janus <|latent_end|> token id.")
-
     args.total_spatial_tokens = args.total_latent_tokens
     args.use_value_prediction = 0
     args.use_action_value_prediction = 0
@@ -1083,6 +1149,7 @@ def train(args):
     accelerator.print(f"spatial_token_mode={getattr(args, 'latent_token_mode', 'v')}")
     accelerator.print(f"spatial_token_fields={','.join(getattr(args, 'latent_token_fields', ['gtlatent']))}")
     accelerator.print(f"total_spatial_tokens={getattr(args, 'total_latent_tokens', 1)}")
+    accelerator.print(f"special_token_vocab_size={len(getattr(args, 'special_token_vocab', []))}")
     accelerator.print(
         f"use_history_trajectory_janus_image={int(bool(getattr(args, 'use_history_trajectory_janus_image', 0)))}"
     )
@@ -1091,6 +1158,7 @@ def train(args):
     )
     accelerator.print(f"use_latent_hidden_sim_loss={int(bool(getattr(args, 'use_latent_hidden_sim_loss', 0)))}")
     accelerator.print(f"latent_hidden_sim_loss_mode={getattr(args, 'latent_hidden_sim_loss_mode', 'siglip')}")
+    accelerator.print(f"latent_hidden_sim_pool_mode={getattr(args, 'latent_hidden_sim_pool_mode', 'pool')}")
     accelerator.print(
         "use_latent_hidden_wan_downsample_sim_loss="
         f"{int(bool(getattr(args, 'use_latent_hidden_wan_downsample_sim_loss', 0)))}"
@@ -1140,17 +1208,10 @@ def train(args):
         "<image_placeholder>",
         "<begin_of_image>",
         "<end_of_image>",
-        "<|latent_pad|>",
-        "<|latent_end|>",
-        "</MOVE>",
-        "</PICK>",
-        "</PLACE>",
-        "</ROTATE>",
-        "</PULL>",
-        "</PUSH>",
-        "</NONE>",
     ]:
         accelerator.print(f"{tok:<22} -> {tokenizer.convert_tokens_to_ids(tok)}")
+    for idx, tok in enumerate(args.special_token_vocab):
+        accelerator.print(f"special_vocab[{idx:02d}] {tok}")
 
     # Freeze non-trainable modules
     for param in model.parameters():
@@ -1483,7 +1544,9 @@ if __name__ == '__main__':
     parser.add_argument('--latent_token_mode', type=str, default='',
                         help='Explicit latent token supervision mode: v=gtlatent, n=gtlatent2, vn=gtlatent+gtlatent2.')
     parser.add_argument('--extra_special_tokens', type=str, default='',
-                        help='Comma- or whitespace-separated extra special tokens inserted before latent special tokens.')
+                        help='Deprecated for MoT2; original tokenizer is no longer expanded.')
+    parser.add_argument('--special_token_vocab', type=str, default=",".join(DEFAULT_SPECIAL_TOKEN_VOCAB),
+                        help='Comma- or whitespace-separated independent spatial-token vocab. Token ids are list indices.')
     parser.add_argument('--img_latents_per_future', type=int, default=0,
                         help='Legacy compatibility option; ignored by token latent CE training')
     parser.add_argument('--state_latents_per_future', type=int, default=0,
@@ -1501,6 +1564,9 @@ if __name__ == '__main__':
     parser.add_argument('--latent_hidden_sim_loss_mode', type=str, default='siglip',
                         choices=['siglip', 'wan_vae'],
                         help='siglip keeps the current Janus future-image cosine loss; wan_vae uses frozen Wan2.1 VAE latent MSE.')
+    parser.add_argument('--latent_hidden_sim_pool_mode', type=str, default='pool',
+                        choices=['pool', 'one_mlp', 'mlp'],
+                        help='SigLIP hidden sim target pooling: pool keeps mean pooling; one_mlp shares attention/proj MLPs; mlp uses per-spatial-token MLPs.')
     parser.add_argument('--latent_hidden_sim_loss_weight', type=float, default=1.0,
                         help='Independent weight for latent hidden-state cosine loss when --use_latent_hidden_sim_loss=1.')
     parser.add_argument('--use_latent_hidden_wan_downsample_sim_loss', type=int, default=0,
@@ -1556,9 +1622,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.cosmos_text_cache_path = str(args.cosmos_text_cache_path or "").strip()
     args.latent_hidden_sim_loss_mode = str(args.latent_hidden_sim_loss_mode or "siglip").lower()
+    args.latent_hidden_sim_pool_mode = str(args.latent_hidden_sim_pool_mode or "pool").lower()
+    args.spatial_hidden_sim_pool_mode = args.latent_hidden_sim_pool_mode
     args.wan21_vae_path = str(args.wan21_vae_path or "").strip()
     args.bridge_pos_scheme = cosmos_janus_mot2_module.normalize_bridge_pos_scheme(args.bridge_pos_scheme)
     resolve_latent_token_args(args)
+    resolve_special_token_vocab_args(args)
     resolve_video_condition_args(args)
     args.total_spatial_tokens = args.total_latent_tokens
     args.train_embed_tokens = 1
@@ -1590,6 +1659,8 @@ if __name__ == '__main__':
         raise ValueError("use_latent_hidden_wan_downsample_sim_loss must be 0 or 1.")
     if args.latent_hidden_sim_loss_mode not in ("siglip", "wan_vae"):
         raise ValueError("latent_hidden_sim_loss_mode must be 'siglip' or 'wan_vae'.")
+    if args.latent_hidden_sim_pool_mode not in ("pool", "one_mlp", "mlp"):
+        raise ValueError("latent_hidden_sim_pool_mode must be 'pool', 'one_mlp', or 'mlp'.")
     if args.use_latent_hidden_sim_loss and args.future_frame_stride <= 0:
         raise ValueError("use_latent_hidden_sim_loss requires future_frame_stride > 0.")
     if args.use_latent_hidden_sim_loss and args.latent_hidden_sim_loss_mode == "wan_vae":
