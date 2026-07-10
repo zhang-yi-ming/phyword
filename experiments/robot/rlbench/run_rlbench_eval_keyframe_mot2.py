@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import sys
 import time
@@ -63,6 +64,29 @@ TASK_PROMPTS = {
         "grasping the picture frame, take it off the wall and place it on the table top",
     ),
 }
+DEFAULT_SPECIAL_TOKEN_VOCAB = [
+    "</PAD>",
+    "</MOVE>",
+    "</PICK>",
+    "</PLACE>",
+    "</ROTATE>",
+    "</PULL>",
+    "</PUSH>",
+    "</NONE>",
+    "</box>",
+    "</broom>",
+    "</charger>",
+    "</frame>",
+    "</fridge>",
+    "</lamp>",
+    "</laptop>",
+    "</phone>",
+    "</toilet>",
+    "</umbrella>",
+    "</watering_can>",
+    "</wine>",
+]
+SPECIAL_TOKEN_VOCAB_FILENAME = "special_token_vocab.json"
 
 
 DEFAULT_PROMPT_SCHEDULE_PATH = str(Path(__file__).with_name("rlbench_keyframe_prompt_schedule.json"))
@@ -123,6 +147,7 @@ class EvalConfig:
     state_latents_per_future: int = 0
     num_future_frames: int = 0
     future_frame_stride: int = 1
+    special_token_vocab: str = ",".join(DEFAULT_SPECIAL_TOKEN_VOCAB)
     cosmos_self_only_bridge: bool = False
     decosmos: bool = False
     use_value_prediction: bool = False
@@ -132,6 +157,7 @@ class EvalConfig:
     bridge_pos_scheme: str = "mrope"
     action_use_latent_prefix: bool = True
     action_self_causal_in_bridge: bool = True
+    action_insert_layer: int = 0
     action_denoise_steps: int = 10
     cosmos_denoise_steps: int = 2
     fps: float = 20.0
@@ -164,6 +190,84 @@ def recreate_directory(path: str) -> None:
     if os.path.exists(path):
         shutil.rmtree(path)
     os.makedirs(path, exist_ok=True)
+
+
+def parse_special_token_vocab(value) -> list[str]:
+    if value is None:
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB)
+    elif isinstance(value, str):
+        raw = value.strip()
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB) if not raw else [
+            part.strip() for part in (raw.split(",") if "," in raw else raw.split()) if part.strip()
+        ]
+    else:
+        tokens = [str(part).strip() for part in value if str(part).strip()]
+    if not tokens:
+        raise ValueError("special_token_vocab must not be empty.")
+    seen = set()
+    deduped = []
+    for token in tokens:
+        if token in seen:
+            raise ValueError(f"Duplicate special token in vocab: {token!r}")
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def load_special_token_vocab(checkpoint_dir: str, fallback) -> list[str]:
+    vocab_path = os.path.join(str(checkpoint_dir), SPECIAL_TOKEN_VOCAB_FILENAME) if checkpoint_dir else ""
+    if vocab_path and os.path.exists(vocab_path):
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            return parse_special_token_vocab(json.load(f))
+    return parse_special_token_vocab(fallback)
+
+
+def derive_special_token_source_words(token_text: str) -> list[str]:
+    chunks = re.findall(r"</([^>]+)>", str(token_text))
+    if not chunks or "".join(f"</{chunk}>" for chunk in chunks) != str(token_text):
+        raise ValueError(f"Cannot derive source words from special token {token_text!r}.")
+    source_words = []
+    for chunk in chunks:
+        source_words.extend(part for part in re.split(r"[^A-Za-z0-9]+", chunk.lower()) if part)
+    if not source_words:
+        raise ValueError(f"Cannot derive non-empty source words from special token {token_text!r}.")
+    return source_words
+
+
+def resolve_special_token_init_ids(tokenizer, special_token_vocab: list[str]) -> list[list[int]]:
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    all_source_ids = []
+    for token_text in special_token_vocab:
+        source_ids = []
+        for source_word in derive_special_token_source_words(token_text):
+            encoded = tokenizer.encode(source_word, add_special_tokens=False)
+            if not encoded:
+                raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to no tokens.")
+            for token_id in encoded:
+                token_id = int(token_id)
+                if unk_id is not None and token_id == int(unk_id) and source_word != getattr(tokenizer, "unk_token", None):
+                    raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to unk id {unk_id}.")
+                source_ids.append(token_id)
+        all_source_ids.append(source_ids)
+    return all_source_ids
+
+
+def validate_special_token_checkpoint_rows(state_dict: dict[str, Any], special_token_vocab: list[str]) -> None:
+    expected = len(special_token_vocab)
+    row_keys = [
+        "special_token_embedding.weight",
+        "special_token_lm_head.weight",
+    ]
+    missing = [key for key in row_keys if key not in state_dict]
+    if missing:
+        raise ValueError(f"Checkpoint is missing independent special-token weights: {missing}")
+    mismatches = []
+    for key in row_keys:
+        rows = int(state_dict[key].shape[0])
+        if rows != expected:
+            mismatches.append(f"{key}: checkpoint_rows={rows}, special_token_vocab={expected}")
+    if mismatches:
+        raise ValueError("Special-token checkpoint rows are incompatible: " + ", ".join(mismatches))
 
 
 def log_message(message: str, log_file=None) -> None:
@@ -390,6 +494,7 @@ def model_load(cfg: EvalConfig):
     cfg.use_value_prediction = False
     cfg.use_action_value_prediction = False
     cfg.total_spatial_tokens = int(cfg.total_latent_tokens)
+    logger.info("Resolved action_insert_layer=%s", int(getattr(cfg, "action_insert_layer", 0) or 0))
     ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
     processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
     tokenizer = processor.tokenizer
@@ -427,6 +532,9 @@ def model_load(cfg: EvalConfig):
 
     state_dict = torch.load(ckpt_path, map_location="cpu")
     validate_checkpoint_vocab_size(state_dict, tokenizer)
+    cfg.special_token_vocab = load_special_token_vocab(base_dir, getattr(cfg, "special_token_vocab", ""))
+    cfg.special_token_init_ids = resolve_special_token_init_ids(tokenizer, cfg.special_token_vocab)
+    validate_special_token_checkpoint_rows(state_dict, cfg.special_token_vocab)
     checkpoint_vocab_size = infer_checkpoint_vocab_size(state_dict)
     ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size=checkpoint_vocab_size)
     cfg.valid_token_vocab_size = int(len(tokenizer))
@@ -911,6 +1019,8 @@ def parse_args() -> EvalConfig:
     cfg.action_self_causal_in_bridge = True
     cfg.use_value_prediction = False
     cfg.use_action_value_prediction = False
+    if int(cfg.action_insert_layer) < 0 or int(cfg.action_insert_layer) > 27:
+        raise ValueError("action_insert_layer must be in [0, 27].")
     if int(cfg.total_latent_tokens) not in (1, 2):
         raise ValueError(
             f"Beta token-latent RLBench eval requires total_latent_tokens=1 or 2, got {cfg.total_latent_tokens}."

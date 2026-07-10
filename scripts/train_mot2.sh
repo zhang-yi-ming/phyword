@@ -19,11 +19,10 @@ DATABASE_ROOT="${DATABASE_ROOT:-/mnt/nas/zhangyiming/database}"
 PRETRAINED_ROOT="${PRETRAINED_ROOT:-${DATABASE_ROOT}/ckpt/pretrained}"
 REQUIRES_ROOT="${REQUIRES_ROOT:-/mnt/nas/zhangyiming/requires}"
 CONDA_BASE="${CONDA_BASE:-/root/miniconda3}"
-# This script should run in the in-place upgraded last05 env.  The shared
-# last05_local_env.sh defaults to last05_qwen3vl for other repos, so restore
-# the script-local default unless the caller explicitly provided an env.
-CONDA_ENV_NAME="${REQUESTED_CONDA_ENV_NAME:-last05}"
-CONDA_ENV_PATH="${REQUESTED_CONDA_ENV_PATH:-${CONDA_BASE}/envs/${CONDA_ENV_NAME}}"
+# Default to the shared env that has been validated for this checkout. Callers
+# can still override CONDA_ENV_NAME or CONDA_ENV_PATH explicitly.
+CONDA_ENV_NAME="${REQUESTED_CONDA_ENV_NAME:-last05_packed}"
+CONDA_ENV_PATH="${REQUESTED_CONDA_ENV_PATH:-${DATABASE_ROOT}/envs/${CONDA_ENV_NAME}}"
 EXPERIMENTS_LIBERO_ROOT="${EXPERIMENTS_LIBERO_ROOT:-${LAST05_BETA_ROOT}/experiments}"
 EXPERIMENTS_RLBENCH_ROOT="${EXPERIMENTS_RLBENCH_ROOT:-${LAST05_BETA_ROOT}/experiments_rlbench}"
 COSMOS_ROOT="${COSMOS_ROOT:-/mnt/nas/zhangyiming/experiments}"
@@ -31,12 +30,17 @@ LIBERO_ROOT="${LIBERO_ROOT:-/mnt/nas/zhangxuheng/LIBERO}"
 PYREP_PYTHON_PATH="${PYREP_PYTHON_PATH:-/mnt/nas/zhangyawen/zhangyiming/python_pkgs}"
 LIFT3D_ROOT="${LIFT3D_ROOT:-${REQUIRES_ROOT}/LIFT3D}"
 RLBENCH_ROOT="${RLBENCH_ROOT:-${LIFT3D_ROOT}/third_party/RLBench}"
+COSMOS_CUDA_SHIM_ROOT="${COSMOS_CUDA_SHIM_ROOT:-${LAST05_BETA_ROOT}/last05_mot2_action_fis}"
 
 cd "${LAST05_ROOT}/scripts"
 source "${CONDA_BASE}/bin/activate" "${CONDA_ENV_PATH}"
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export PATH="${CONDA_ENV_PATH}/bin:$PATH"
-export PYTHONPATH="${LAST05_ROOT}:${PYTHONPATH:-}"
+if [[ -f "${COSMOS_CUDA_SHIM_ROOT}/cosmos_cuda.py" ]]; then
+  export PYTHONPATH="${LAST05_ROOT}:${COSMOS_CUDA_SHIM_ROOT}:${PYTHONPATH:-}"
+else
+  export PYTHONPATH="${LAST05_ROOT}:${PYTHONPATH:-}"
+fi
 LEGACY_LAST05_1_BIN="${LEGACY_LAST05_1_BIN:-/media/miniconda3/envs/last05.1/bin}"
 if [[ -d "${LEGACY_LAST05_1_BIN}" ]]; then
   export PATH="${LEGACY_LAST05_1_BIN}:$PATH"
@@ -48,10 +52,10 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_trex_mot2_libero_spatial}"
-RUN_NAME="${RUN_NAME:-cosmos2B_trex2B_mot2_libero_spatial_0ce}"
+RUN_NAME="${RUN_NAME:-cosmos2B_trex2B_libero_spatial}"
 OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_trex_action_spatial}"
 
-DATA_JSON="${DATA_JSON:-${DATABASE_ROOT}/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/train_with_atomic_action.json}"
+DATA_JSON="${DATA_JSON:-${DATABASE_ROOT}/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/train_with_atomic_action_shared.json}"
 ACTION_EXPERT_PATH="${ACTION_EXPERT_PATH:-${PRETRAINED_ROOT}/T-Rex_pretrain_mecka22k_epoch1}"
 COSMOS_PT_PATH="${COSMOS_PT_PATH:-${PRETRAINED_ROOT}/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXP_NAME="${COSMOS_EXP_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
@@ -59,11 +63,11 @@ COSMOS_EXP_NAME="${COSMOS_EXP_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26
 COSMOS_TEXT_CACHE_PATH="${COSMOS_TEXT_CACHE_PATH:-${DATABASE_ROOT}/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/cosmos_text_cache_raw_full_concat}"
 
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
-TRAIN_BSZ="${TRAIN_BSZ:-8}"
+TRAIN_BSZ="${TRAIN_BSZ:-6}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 LR="${LR:-1e-4}"
 COSMOS_CORE_LR_RATIO="${COSMOS_CORE_LR_RATIO:-0.02}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 
 VIDEO_H="${VIDEO_H:-256}"
 VIDEO_W="${VIDEO_W:-256}"
@@ -88,19 +92,22 @@ case "${SPATIAL_TOKEN_MODE}" in
     ;;
 esac
 
-DEFAULT_EXTRA_SPECIAL_TOKENS="</PAD>,</MOVE>,</PICK>,</PLACE>,</ROTATE>,</PULL>,</PUSH>,</NONE>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
-EXTRA_SPECIAL_TOKENS="${EXTRA_SPECIAL_TOKENS:-${DEFAULT_EXTRA_SPECIAL_TOKENS}}"
+DEFAULT_SPECIAL_TOKEN_VOCAB="</MOVE>,</BOWWL>,</PICK>,</PLACE>,</APPROACH>,</bowl>"
+SPECIAL_TOKEN_VOCAB="${SPECIAL_TOKEN_VOCAB:-${DEFAULT_SPECIAL_TOKEN_VOCAB}}"
 
 VIDEO_LOSS_WEIGHT="${VIDEO_LOSS_WEIGHT:-1}"
-SPATIAL_LOSS_WEIGHT="${SPATIAL_LOSS_WEIGHT:-0}"
-USE_SPATIAL_HIDDEN_SIM_LOSS="${USE_SPATIAL_HIDDEN_SIM_LOSS:-0}"
+SPATIAL_LOSS_WEIGHT="${SPATIAL_LOSS_WEIGHT:-1}"
+USE_SPATIAL_HIDDEN_SIM_LOSS="${USE_SPATIAL_HIDDEN_SIM_LOSS:-1}"
 SPATIAL_HIDDEN_SIM_LOSS_MODE="${SPATIAL_HIDDEN_SIM_LOSS_MODE:-siglip}"
-SPATIAL_HIDDEN_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT:-0}"
+SPATIAL_HIDDEN_SIM_POOL_MODE="${SPATIAL_HIDDEN_SIM_POOL_MODE:-pool}"
+SPATIAL_HIDDEN_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT:-1}"
 USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS="${USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS:-0}"
 SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT:-1.0}"
 WAN21_VAE_PATH="${WAN21_VAE_PATH:-${PRETRAINED_ROOT}/wan2.1_vae/original/Wan2.1_VAE.pth}"
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-8}"
 BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
+DETACH_ACTION_COSMOS_KV="${DETACH_ACTION_COSMOS_KV:-0}"
+ACTION_INSERT_LAYER="${ACTION_INSERT_LAYER:-0}"
 
 echo ">>> Starting 2-MoT Libero training: ${RUN_NAME}"
 echo ">>> Spatial token mode: ${SPATIAL_TOKEN_MODE} count=${TOTAL_SPATIAL_TOKEN_COUNT}"
@@ -140,17 +147,20 @@ accelerate launch --config_file ../config/sft.yaml \
   --weight_decay 0 \
   --total_latent_tokens "${TOTAL_SPATIAL_TOKEN_COUNT}" \
   --latent_token_mode "${SPATIAL_TOKEN_MODE}" \
-  --extra_special_tokens "${EXTRA_SPECIAL_TOKENS}" \
+  --special_token_vocab "${SPECIAL_TOKEN_VOCAB}" \
   --future_frame_stride "${FUTURE_FRAME_STRIDE}" \
   --video_loss_weight "${VIDEO_LOSS_WEIGHT}" \
   --latent_loss_weight "${SPATIAL_LOSS_WEIGHT}" \
   --use_latent_hidden_sim_loss "${USE_SPATIAL_HIDDEN_SIM_LOSS}" \
   --latent_hidden_sim_loss_mode "${SPATIAL_HIDDEN_SIM_LOSS_MODE}" \
+  --latent_hidden_sim_pool_mode "${SPATIAL_HIDDEN_SIM_POOL_MODE}" \
   --latent_hidden_sim_loss_weight "${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT}" \
   --use_latent_hidden_wan_downsample_sim_loss "${USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS}" \
   --latent_hidden_wan_downsample_sim_loss_weight "${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT}" \
   --wan21_vae_path "${WAN21_VAE_PATH}" \
   --bridge_pos_scheme "${BRIDGE_POS_SCHEME}" \
+  --detach_action_cosmos_kv "${DETACH_ACTION_COSMOS_KV}" \
+  --action_insert_layer "${ACTION_INSERT_LAYER}" \
   --freeze_video_after "${FREEZE_VIDEO_AFTER:-100}" \
   --robot_state "${ROBOT_STATE}" \
   --state_placeholder_tokens "${STATE_PLACEHOLDER_TOKENS}" \

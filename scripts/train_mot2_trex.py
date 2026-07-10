@@ -114,25 +114,92 @@ DEFAULT_TREX_PROCESSOR_PATH = (
     "/mnt/nas/zhangyiming/database/ckpt/pretrained/"
     "T-Rex_pretrain_mecka22k_epoch1/checkpoint-0-610000/processor"
 )
+DEFAULT_SPECIAL_TOKEN_VOCAB = [
+    "</PAD>",
+    "</MOVE>",
+    "</PICK>",
+    "</PLACE>",
+    "</ROTATE>",
+    "</PULL>",
+    "</PUSH>",
+    "</NONE>",
+    "</box>",
+    "</broom>",
+    "</charger>",
+    "</frame>",
+    "</fridge>",
+    "</lamp>",
+    "</laptop>",
+    "</phone>",
+    "</toilet>",
+    "</umbrella>",
+    "</watering_can>",
+    "</wine>",
+]
+SPECIAL_TOKEN_VOCAB_FILENAME = "special_token_vocab.json"
+
+
+def parse_special_token_vocab(value) -> List[str]:
+    if value is None:
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB)
+    elif isinstance(value, str):
+        raw = value.strip()
+        tokens = list(DEFAULT_SPECIAL_TOKEN_VOCAB) if not raw else [
+            part.strip() for part in (raw.split(",") if "," in raw else raw.split()) if part.strip()
+        ]
+    else:
+        tokens = [str(part).strip() for part in value if str(part).strip()]
+    if not tokens:
+        raise ValueError("special_token_vocab must not be empty.")
+    seen = set()
+    deduped = []
+    for token in tokens:
+        if token in seen:
+            raise ValueError(f"Duplicate special token in vocab: {token!r}")
+        seen.add(token)
+        deduped.append(token)
+    return deduped
+
+
+def derive_special_token_source_words(token_text: str) -> List[str]:
+    chunks = re.findall(r"</([^>]+)>", str(token_text))
+    if not chunks or "".join(f"</{chunk}>" for chunk in chunks) != str(token_text):
+        raise ValueError(f"Cannot derive source words from special token {token_text!r}.")
+    source_words = []
+    for chunk in chunks:
+        source_words.extend(part for part in re.split(r"[^A-Za-z0-9]+", chunk.lower()) if part)
+    if not source_words:
+        raise ValueError(f"Cannot derive non-empty source words from special token {token_text!r}.")
+    return source_words
+
+
+def resolve_special_token_init_ids(tokenizer, special_token_vocab: List[str]) -> List[List[int]]:
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    all_source_ids = []
+    for token_text in special_token_vocab:
+        source_ids = []
+        for source_word in derive_special_token_source_words(token_text):
+            encoded = tokenizer.encode(source_word, add_special_tokens=False)
+            if not encoded:
+                raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to no tokens.")
+            for token_id in encoded:
+                token_id = int(token_id)
+                if unk_id is not None and token_id == int(unk_id) and source_word != getattr(tokenizer, "unk_token", None):
+                    raise ValueError(f"Source word {source_word!r} for {token_text!r} encoded to unk id {unk_id}.")
+                source_ids.append(token_id)
+        all_source_ids.append(source_ids)
+    return all_source_ids
+
+
+def resolve_special_token_vocab_args(args):
+    vocab = parse_special_token_vocab(getattr(args, "special_token_vocab", None))
+    args.special_token_vocab = vocab
+    args.special_token_to_id = {token: idx for idx, token in enumerate(vocab)}
+    return args
 
 
 def build_janus_action_prompt_suffix(use_history_trajectory: bool) -> str:
     return JANUS_ACTION_PROMPT_SUFFIX
-
-
-def add_extra_special_tokens_to_tokenizer(tokenizer, extra_special_tokens: str):
-    tokens = []
-    for raw in re.split(r"[,\s]+", str(extra_special_tokens or "")):
-        token = raw.strip()
-        if token:
-            tokens.append(token)
-    if not tokens:
-        return 0
-    existing = set(tokenizer.get_vocab().keys())
-    to_add = [token for token in tokens if token not in existing]
-    if not to_add:
-        return 0
-    return tokenizer.add_special_tokens({"additional_special_tokens": to_add})
 
 
 def build_qwen_chat_prompt(processor, user_text: str) -> str:
@@ -448,23 +515,15 @@ class VLACotDataset(Dataset):
         if field_name not in sample:
             raise KeyError(f"Dataset sample index={index} is missing required '{field_name}' field.")
         gt_text = str(sample[field_name])
-        token_ids = self.tokenizer.encode(gt_text, add_special_tokens=False)
-        if len(token_ids) != 1:
+        token_to_id = getattr(self.config, "special_token_to_id", None)
+        if token_to_id is None:
+            raise ValueError("config.special_token_to_id is required for spatial token labels.")
+        if gt_text not in token_to_id:
             raise ValueError(
-                f"Dataset sample index={index} {field_name}={gt_text!r} must encode to exactly "
-                f"one tokenizer id, got {len(token_ids)} ids: {token_ids}."
+                f"Dataset sample index={index} {field_name}={gt_text!r} is not in special_token_vocab. "
+                f"Known tokens: {getattr(self.config, 'special_token_vocab', [])}"
             )
-        token_id = int(token_ids[0])
-        unk_id = getattr(self.tokenizer, "unk_token_id", None)
-        if (
-            unk_id is not None
-            and token_id == int(unk_id)
-            and gt_text != getattr(self.tokenizer, "unk_token", None)
-        ):
-            raise ValueError(
-                f"Dataset sample index={index} {field_name}={gt_text!r} encoded to unk token id {unk_id}."
-            )
-        return torch.tensor(token_id, dtype=torch.long)
+        return torch.tensor(int(token_to_id[gt_text]), dtype=torch.long)
 
     def _encode_gt_latent_tokens(self, sample, index):
         token_count = self._latent_token_count()
@@ -867,6 +926,8 @@ def save_checkpoint(model, processor, accelerator, args, epoch, global_step, sta
         if stats_data is not None:
             with open(os.path.join(save_dir, 'train_statistics.json'), 'w') as f:
                 json.dump(stats_data, f, indent=2)
+        with open(os.path.join(save_dir, SPECIAL_TOKEN_VOCAB_FILENAME), 'w') as f:
+            json.dump(list(args.special_token_vocab), f, indent=2)
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -902,14 +963,11 @@ def train(args):
     trex_ckpt_dir = resolve_trex_checkpoint_path(args.action_expert_path)
     processor_path = os.path.join(trex_ckpt_dir, "processor")
     processor = load_trex_processor(processor_path)
-    added_extra_special_tokens = add_extra_special_tokens_to_tokenizer(
-        processor.tokenizer,
-        args.extra_special_tokens,
-    )
+    args.special_token_init_ids = resolve_special_token_init_ids(processor.tokenizer, args.special_token_vocab)
     args.trex_image_token_id = int(processor.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
     accelerator.print(f"trex_processor={processor_path}")
-    accelerator.print(f"extra_special_tokens={getattr(processor.tokenizer, 'additional_special_tokens', [])}")
-    accelerator.print(f"added_extra_special_tokens={added_extra_special_tokens}")
+    accelerator.print(f"special_token_vocab={args.special_token_vocab}")
+    accelerator.print(f"special_token_vocab_size={len(args.special_token_vocab)}")
 
     # ----------------------------------------------------------------
     # Load T-Rex. Shape-mismatched 62D pretraining action heads are skipped and
@@ -925,8 +983,6 @@ def train(args):
         verbose=accelerator.is_main_process,
     )
     accelerator.print(f"T-Rex skipped mismatched tensors={len(trex_loading_info['skipped_mismatch'])}")
-    ensure_janus_tokenizer_alignment(janus_model, processor.tokenizer, accelerator)
-    initialize_action_special_token_rows(janus_model, processor.tokenizer, accelerator)
 
     # ----------------------------------------------------------------
     # Load Cosmos
@@ -995,6 +1051,7 @@ def train(args):
     )
     accelerator.print(f"use_latent_hidden_sim_loss={int(bool(getattr(args, 'use_latent_hidden_sim_loss', 0)))}")
     accelerator.print(f"latent_hidden_sim_loss_mode={getattr(args, 'latent_hidden_sim_loss_mode', 'siglip')}")
+    accelerator.print(f"latent_hidden_sim_pool_mode={getattr(args, 'latent_hidden_sim_pool_mode', 'pool')}")
     accelerator.print(
         "use_latent_hidden_wan_downsample_sim_loss="
         f"{int(bool(getattr(args, 'use_latent_hidden_wan_downsample_sim_loss', 0)))}"
@@ -1007,6 +1064,8 @@ def train(args):
     accelerator.print("value_prediction=0")
     accelerator.print(f"state_latents_per_future={getattr(args, 'state_latents_per_future', 0)}")
     accelerator.print(f"bridge_pos_scheme={getattr(args, 'bridge_pos_scheme', 'mrope')}")
+    accelerator.print(f"detach_action_cosmos_kv={int(bool(getattr(args, 'detach_action_cosmos_kv', 0)))}")
+    accelerator.print(f"action_insert_layer={int(getattr(args, 'action_insert_layer', 0))}")
     accelerator.print(f"cosmos_janus_mot2_module={getattr(cosmos_janus_mot2_module, '__file__', 'N/A')}")
 
     accelerator.print("检查词表")
@@ -1382,8 +1441,8 @@ if __name__ == '__main__':
                         help='Latent token mode/count. Accepts v/1, n, or vn/2; defaults to v.')
     parser.add_argument('--latent_token_mode', type=str, default='',
                         help='Explicit latent token supervision mode: v=gtlatent, n=gtlatent2, vn=gtlatent+gtlatent2.')
-    parser.add_argument('--extra_special_tokens', type=str, default='',
-                        help='Comma- or whitespace-separated extra special tokens inserted before latent special tokens.')
+    parser.add_argument('--special_token_vocab', type=str, default=','.join(DEFAULT_SPECIAL_TOKEN_VOCAB),
+                        help='Comma- or whitespace-separated independent spatial-token vocabulary.')
     parser.add_argument('--img_latents_per_future', type=int, default=0,
                         help='Legacy compatibility option; ignored by token latent CE training')
     parser.add_argument('--state_latents_per_future', type=int, default=0,
@@ -1401,6 +1460,9 @@ if __name__ == '__main__':
     parser.add_argument('--latent_hidden_sim_loss_mode', type=str, default='siglip',
                         choices=['siglip', 'wan_vae'],
                         help='siglip keeps the current Janus future-image cosine loss; wan_vae uses frozen Wan2.1 VAE latent MSE.')
+    parser.add_argument('--latent_hidden_sim_pool_mode', type=str, default='pool',
+                        choices=['pool', 'one_mlp', 'mlp'],
+                        help='SigLIP hidden sim target pooling: pool keeps mean pooling; one_mlp shares attention/proj MLPs; mlp uses per-spatial-token MLPs.')
     parser.add_argument('--latent_hidden_sim_loss_weight', type=float, default=1.0,
                         help='Independent weight for latent hidden-state cosine loss when --use_latent_hidden_sim_loss=1.')
     parser.add_argument('--use_latent_hidden_wan_downsample_sim_loss', type=int, default=0,
@@ -1440,6 +1502,10 @@ if __name__ == '__main__':
     parser.add_argument('--bridge_pos_scheme', type=str, default='mrope',
                         choices=['mrope', 'mrope_interleave', 'llama1d', 'local', 'last0'],
                         help='Bridge rotary mode for latent/action QK. Use `mrope` for A1/Qwen3-VL-style multimodal 3D RoPE, `mrope_interleave` for THW-interleaved bridge basis, or `llama1d` for native Llama-style 1D RoPE. Legacy aliases `local` and `last0` normalize to `mrope`.')
+    parser.add_argument('--detach_action_cosmos_kv', type=int, default=0,
+                        help='If 1, action/spatial losses see detached Cosmos KV while video loss still trains Cosmos normally.')
+    parser.add_argument('--action_insert_layer', type=int, default=0,
+                        help='0 keeps legacy behavior. If >0, insert t/action after this many MoT layers.')
 
 
 
@@ -1450,8 +1516,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.cosmos_text_cache_path = str(args.cosmos_text_cache_path or "").strip()
     args.latent_hidden_sim_loss_mode = str(args.latent_hidden_sim_loss_mode or "siglip").lower()
+    args.latent_hidden_sim_pool_mode = str(args.latent_hidden_sim_pool_mode or "pool").lower()
+    args.spatial_hidden_sim_pool_mode = args.latent_hidden_sim_pool_mode
     args.wan21_vae_path = str(args.wan21_vae_path or "").strip()
     args.bridge_pos_scheme = cosmos_janus_mot2_module.normalize_bridge_pos_scheme(args.bridge_pos_scheme)
+    resolve_special_token_vocab_args(args)
     resolve_latent_token_args(args)
     resolve_video_condition_args(args)
     args.total_spatial_tokens = args.total_latent_tokens
@@ -1483,12 +1552,18 @@ if __name__ == '__main__':
         raise ValueError("state_encoding_mode='mlp' requires state_placeholder_tokens=1 when robot_state is enabled.")
     if args.use_history_trajectory_janus_image not in (0, 1):
         raise ValueError("use_history_trajectory_janus_image must be 0 or 1.")
+    if args.detach_action_cosmos_kv not in (0, 1):
+        raise ValueError("detach_action_cosmos_kv must be 0 or 1.")
+    if args.action_insert_layer < 0 or args.action_insert_layer > 27:
+        raise ValueError("action_insert_layer must be in [0, 27].")
     if args.use_latent_hidden_sim_loss not in (0, 1):
         raise ValueError("use_latent_hidden_sim_loss must be 0 or 1.")
     if args.use_latent_hidden_wan_downsample_sim_loss not in (0, 1):
         raise ValueError("use_latent_hidden_wan_downsample_sim_loss must be 0 or 1.")
     if args.latent_hidden_sim_loss_mode not in ("siglip", "wan_vae"):
         raise ValueError("latent_hidden_sim_loss_mode must be 'siglip' or 'wan_vae'.")
+    if args.latent_hidden_sim_pool_mode not in ("pool", "one_mlp", "mlp"):
+        raise ValueError("latent_hidden_sim_pool_mode must be 'pool', 'one_mlp', or 'mlp'.")
     if args.use_latent_hidden_sim_loss and args.future_frame_stride <= 0:
         raise ValueError("use_latent_hidden_sim_loss requires future_frame_stride > 0.")
     if args.use_latent_hidden_sim_loss and args.latent_hidden_sim_loss_mode == "wan_vae":

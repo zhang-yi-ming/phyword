@@ -38,11 +38,16 @@ from models.cosmos_janus_action_spatial import (  # noqa: E402
 from models.trex_action_backend import TrexActionModel, resolve_trex_checkpoint_path  # noqa: E402
 from scripts.train_mot2_trex_rlbench_keyframe import (  # noqa: E402
     VLACotDataset,
-    add_extra_special_tokens_to_tokenizer,
     build_front_pic_path,
     clipped_keyframe_indices,
     parse_front_pic_index,
     resolve_rlbench_episode_key,
+)
+from experiments.robot.rlbench.run_rlbench_eval_keyframe_mot2 import (  # noqa: E402
+    DEFAULT_SPECIAL_TOKEN_VOCAB,
+    load_special_token_vocab,
+    resolve_special_token_init_ids,
+    validate_special_token_checkpoint_rows,
 )
 from utils.cosmos_text_cache import CosmosQwenTextEmbedder, CosmosTextEmbeddingCache  # noqa: E402
 
@@ -147,7 +152,7 @@ class TrainsetAttnVisConfig:
     state_encoding_mode: str = "mlp"
     total_latent_tokens: str = ""
     latent_token_mode: str = ""
-    extra_special_tokens: str = ""
+    special_token_vocab: str = ",".join(DEFAULT_SPECIAL_TOKEN_VOCAB)
     img_latents_per_future: int = 0
     state_latents_per_future: int = 0
     num_future_frames: int = 0
@@ -159,6 +164,7 @@ class TrainsetAttnVisConfig:
     bridge_pos_scheme: str = "mrope"
     action_use_latent_prefix: bool = True
     action_self_causal_in_bridge: bool = True
+    action_insert_layer: int = 0
     action_denoise_steps: int = 10
     cosmos_denoise_steps: int = 2
     fps: float = 10.0
@@ -203,6 +209,9 @@ def parse_args() -> TrainsetAttnVisConfig:
             f"got {cfg.attention_visualization_top_softness}."
         )
     resolve_spatial_token_args(cfg)
+    cfg.action_insert_layer = int(getattr(cfg, "action_insert_layer", 0) or 0)
+    if cfg.action_insert_layer < 0 or cfg.action_insert_layer > 27:
+        raise ValueError("action_insert_layer must be in [0, 27].")
     return cfg
 
 
@@ -386,9 +395,6 @@ def model_load(cfg: TrainsetAttnVisConfig, log_file=None):
     ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
     processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
     tokenizer = processor.tokenizer
-    if str(getattr(cfg, "extra_special_tokens", "") or "").strip():
-        added = add_extra_special_tokens_to_tokenizer(tokenizer, cfg.extra_special_tokens)
-        log_message(f"Added extra special tokens for visualization tokenizer: {added}", log_file)
     cfg.janus_image_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
     cfg.janus_image_end_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
     cfg.latent_end_id = tokenizer.eos_token_id
@@ -426,6 +432,9 @@ def model_load(cfg: TrainsetAttnVisConfig, log_file=None):
     log_message(f"Loading fine-tuned state dict from {ckpt_path}", log_file)
     state_dict = torch.load(ckpt_path, map_location="cpu")
     validate_checkpoint_vocab_size(state_dict, tokenizer)
+    cfg.special_token_vocab = load_special_token_vocab(base_dir, getattr(cfg, "special_token_vocab", ""))
+    cfg.special_token_init_ids = resolve_special_token_init_ids(tokenizer, cfg.special_token_vocab)
+    validate_special_token_checkpoint_rows(state_dict, cfg.special_token_vocab)
     checkpoint_vocab_size = infer_checkpoint_vocab_size(state_dict)
     ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size=checkpoint_vocab_size)
     cfg.valid_token_vocab_size = int(len(tokenizer))
@@ -562,6 +571,11 @@ class AttentionMapRecorder:
         if self.total_spatial_tokens not in (1, 2):
             raise ValueError(f"total_latent_tokens must be 1 or 2, got {self.total_spatial_tokens}.")
         self.num_layers = int(num_layers)
+        self.first_action_layer_idx = int(getattr(cfg, "action_insert_layer", 0) or 0)
+        if self.first_action_layer_idx < 0 or self.first_action_layer_idx >= self.num_layers:
+            raise ValueError(
+                f"action_insert_layer must be in [0, {self.num_layers - 1}], got {self.first_action_layer_idx}."
+            )
         self.alpha = float(getattr(cfg, "attention_visualization_alpha", 0.45) or 0.45)
         self.tile_size = max(16, int(getattr(cfg, "attention_visualization_tile_size", 256) or 256))
         self.top_ratio = getattr(cfg, "attention_visualization_top_ratio", None)
@@ -789,9 +803,11 @@ class AttentionMapRecorder:
             if label not in {"spatial0", "spatial1"}:
                 return
         elif query_kind == "action":
-            if layer_idx == 0:
+            if layer_idx == self.first_action_layer_idx:
                 self.action_denoise_step += 1
                 self.capture_current_action_step = self.action_denoise_step == self._target_action_step()
+            if layer_idx < self.first_action_layer_idx:
+                return
             if self.action_denoise_step < 0:
                 raise RuntimeError("Action recorder saw a nonzero layer before layer 0.")
             if not self.capture_current_action_step:

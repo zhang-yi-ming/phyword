@@ -229,6 +229,18 @@ class TrexActionModel(nn.Module):
         image_grid_thw: torch.Tensor,
         batch_size: int,
     ) -> torch.Tensor:
+        return self.visual_token_features(
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            batch_size=batch_size,
+        ).mean(dim=1)
+
+    def visual_token_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
         if pixel_values is None or image_grid_thw is None:
             raise ValueError("pixel_values and image_grid_thw are required for T-Rex visual features.")
         dtype = self.vla.model.embed_tokens.weight.dtype
@@ -247,5 +259,7 @@ class TrexActionModel(nn.Module):
                 f"Expected one image per batch item for visual_mean_features, "
                 f"got grids={len(counts)} batch={batch_size}."
             )
+        if len(set(counts)) != 1:
+            raise ValueError(f"Expected equal visual token counts per batch item, got {counts}.")
         chunks = torch.split(features, counts, dim=0)
-        return torch.stack([chunk.mean(dim=0) for chunk in chunks], dim=0)
+        return torch.stack(list(chunks), dim=0)

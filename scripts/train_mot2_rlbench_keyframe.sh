@@ -79,19 +79,22 @@ case "${SPATIAL_TOKEN_MODE}" in
     ;;
 esac
 
-DEFAULT_EXTRA_SPECIAL_TOKENS="</PAD>,</MOVE>,</PICK>,</PLACE>,</ROTATE>,</PULL>,</PUSH>,</NONE>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
-EXTRA_SPECIAL_TOKENS="${EXTRA_SPECIAL_TOKENS:-${DEFAULT_EXTRA_SPECIAL_TOKENS}}"
+DEFAULT_SPECIAL_TOKEN_VOCAB="</PAD>,</MOVE>,</PICK>,</PLACE>,</ROTATE>,</PULL>,</PUSH>,</NONE>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
+SPECIAL_TOKEN_VOCAB="${SPECIAL_TOKEN_VOCAB:-${DEFAULT_SPECIAL_TOKEN_VOCAB}}"
 
 VIDEO_LOSS_WEIGHT="${VIDEO_LOSS_WEIGHT:-1}"
 SPATIAL_LOSS_WEIGHT="${SPATIAL_LOSS_WEIGHT:-1.0}"
 USE_SPATIAL_HIDDEN_SIM_LOSS="${USE_SPATIAL_HIDDEN_SIM_LOSS:-1}"
 SPATIAL_HIDDEN_SIM_LOSS_MODE="${SPATIAL_HIDDEN_SIM_LOSS_MODE:-siglip}"
+SPATIAL_HIDDEN_SIM_POOL_MODE="${SPATIAL_HIDDEN_SIM_POOL_MODE:-pool}"
 SPATIAL_HIDDEN_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT:-1.0}"
 USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS="${USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS:-0}"
 SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT:-1.0}"
 WAN21_VAE_PATH="${WAN21_VAE_PATH:-${PRETRAINED_ROOT}/wan2.1_vae/original/Wan2.1_VAE.pth}"
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-1}"
 BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
+DETACH_ACTION_COSMOS_KV="${DETACH_ACTION_COSMOS_KV:-0}"
+ACTION_INSERT_LAYER="${ACTION_INSERT_LAYER:-0}"
 
 echo ">>> Starting 2-MoT RLBench keyframe training: ${RUN_NAME}"
 echo ">>> Spatial token mode: ${SPATIAL_TOKEN_MODE} count=${TOTAL_SPATIAL_TOKEN_COUNT}"
@@ -131,17 +134,20 @@ accelerate launch --config_file ../config/sft.yaml \
   --weight_decay 0 \
   --total_latent_tokens "${TOTAL_SPATIAL_TOKEN_COUNT}" \
   --latent_token_mode "${SPATIAL_TOKEN_MODE}" \
-  --extra_special_tokens "${EXTRA_SPECIAL_TOKENS}" \
+  --special_token_vocab "${SPECIAL_TOKEN_VOCAB}" \
   --future_frame_stride "${FUTURE_FRAME_STRIDE}" \
   --video_loss_weight "${VIDEO_LOSS_WEIGHT}" \
   --latent_loss_weight "${SPATIAL_LOSS_WEIGHT}" \
   --use_latent_hidden_sim_loss "${USE_SPATIAL_HIDDEN_SIM_LOSS}" \
   --latent_hidden_sim_loss_mode "${SPATIAL_HIDDEN_SIM_LOSS_MODE}" \
+  --latent_hidden_sim_pool_mode "${SPATIAL_HIDDEN_SIM_POOL_MODE}" \
   --latent_hidden_sim_loss_weight "${SPATIAL_HIDDEN_SIM_LOSS_WEIGHT}" \
   --use_latent_hidden_wan_downsample_sim_loss "${USE_SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS}" \
   --latent_hidden_wan_downsample_sim_loss_weight "${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT}" \
   --wan21_vae_path "${WAN21_VAE_PATH}" \
   --bridge_pos_scheme "${BRIDGE_POS_SCHEME}" \
+  --detach_action_cosmos_kv "${DETACH_ACTION_COSMOS_KV}" \
+  --action_insert_layer "${ACTION_INSERT_LAYER}" \
   --freeze_video_after "${FREEZE_VIDEO_AFTER:-300}" \
   --robot_state "${ROBOT_STATE}" \
   --state_placeholder_tokens "${STATE_PLACEHOLDER_TOKENS}" \
