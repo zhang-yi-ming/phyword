@@ -992,9 +992,8 @@ def train(args):
         wandb.init(project=args.experiment_name, name=args.run_name, config=args, dir=args.log_dir)
 
     if not args.model_path:
-        args.model_path = args.action_expert_path
-    trex_ckpt_dir = resolve_trex_checkpoint_path(args.action_expert_path)
-    processor_path = os.path.join(trex_ckpt_dir, "processor")
+        args.model_path = args.qwen3vl2b_model_path
+    processor_path = args.qwen3vl2b_model_path
     processor = load_trex_processor(processor_path)
     args.special_token_init_ids = resolve_special_token_init_ids(processor.tokenizer, args.special_token_vocab)
     args.trex_image_token_id = int(processor.tokenizer.convert_tokens_to_ids("<|image_pad|>"))
@@ -1003,11 +1002,20 @@ def train(args):
     accelerator.print(f"special_token_vocab_size={len(args.special_token_vocab)}")
 
     # ----------------------------------------------------------------
-    # Load the T-Rex action expert. Shape-mismatched 62D pretraining action
-    # heads are skipped and reinitialized for the requested action_dim.
+    # Load Qwen3VL base for the first 28 right-branch layers, then transplant
+    # T-Rex flow/action modules and last 4 action layers.
     # ----------------------------------------------------------------
+    accelerator.print("Loading Qwen3VL2B base checkpoint...")
+    janus_model, _ = TrexActionModel.from_qwen3vl_checkpoint(
+        args.qwen3vl2b_model_path,
+        action_dim=args.action_dim,
+        action_chunk=args.action_chunk,
+        torch_dtype=torch.bfloat16,
+        use_robot_state=bool(args.robot_state),
+        verbose=accelerator.is_main_process,
+    )
     accelerator.print("Loading T-Rex action expert checkpoint...")
-    janus_model, trex_loading_info = TrexActionModel.from_checkpoint(
+    trex_action_model, trex_loading_info = TrexActionModel.from_checkpoint(
         args.action_expert_path,
         action_dim=args.action_dim,
         action_chunk=args.action_chunk,
@@ -1015,6 +1023,9 @@ def train(args):
         use_robot_state=bool(args.robot_state),
         verbose=accelerator.is_main_process,
     )
+    janus_model.transplant_action_components_from(trex_action_model, fast_layer_count=4)
+    del trex_action_model
+    gc.collect()
     accelerator.print(f"T-Rex skipped mismatched tensors={len(trex_loading_info['skipped_mismatch'])}")
 
     # ----------------------------------------------------------------
@@ -1097,8 +1108,9 @@ def train(args):
     accelerator.print("value_prediction=0")
     accelerator.print(f"state_latents_per_future={getattr(args, 'state_latents_per_future', 0)}")
     accelerator.print(f"bridge_pos_scheme={getattr(args, 'bridge_pos_scheme', 'mrope')}")
-    accelerator.print(f"detach_action_cosmos_kv={int(bool(getattr(args, 'detach_action_cosmos_kv', 0)))}")
-    accelerator.print(f"action_insert_layer={int(getattr(args, 'action_insert_layer', 0))}")
+    accelerator.print(f"qwen3vl2b_model_path={getattr(args, 'qwen3vl2b_model_path', '')}")
+    accelerator.print(f"right_single_attn_position={getattr(args, 'right_single_attn_position', 'last4')}")
+    accelerator.print("right_branch_layers=32 prefix_layers=28 action_layers=4")
     accelerator.print(f"cosmos_janus_mot2_module={getattr(cosmos_janus_mot2_module, '__file__', 'N/A')}")
 
     accelerator.print("检查词表")
@@ -1463,10 +1475,16 @@ if __name__ == '__main__':
                         help='If 1 and num_workers > 0, keep DataLoader workers alive across epochs.')
 
     # Action expert
+    parser.add_argument('--qwen3vl2b_model_path', type=str,
+                        default='/mnt/amlfs-07/shared/physicalword/ckpt/pretraine/Qwen3-VL-2B-Instruct',
+                        help='Path to the plain Qwen3VL2B checkpoint for the first 28 right-branch layers.')
     parser.add_argument('--action_intermediate_size', type=int, default=0,
                         help='If >0, slim action MLP intermediate size')
     parser.add_argument('--action_self_causal_in_bridge', type=int, default=1,
                         help='If 1, training uses causal action->action bridge attention; if 0, action->action is bidirectional')
+    parser.add_argument('--right_single_attn_position', type=str, default='last4',
+                        choices=['first4', 'last4'],
+                        help='Where to place the 4 right-branch standalone layers needed to align 32 right layers with 28 Cosmos layers.')
 
 
     # Latent CoT
@@ -1533,15 +1551,8 @@ if __name__ == '__main__':
     parser.add_argument('--action_use_latent_prefix', type=int, default=0,
                         help='If 1, prepend encoded wrist image and current state tokens to the action branch.')
     parser.add_argument('--bridge_pos_scheme', type=str, default='mrope',
-                        choices=['mrope', 'mrope_interleave', 'llama1d', 'local', 'last0'],
-                        help='Bridge rotary mode for latent/action QK. Use `mrope` for A1/Qwen3-VL-style multimodal 3D RoPE, `mrope_interleave` for THW-interleaved bridge basis, or `llama1d` for native Llama-style 1D RoPE. Legacy aliases `local` and `last0` normalize to `mrope`.')
-    parser.add_argument('--detach_action_cosmos_kv', type=int, default=0,
-                        help='If 1, action/spatial losses see detached Cosmos KV while video loss still trains Cosmos normally.')
-    parser.add_argument('--action_insert_layer', type=int, default=0,
-                        help='0 keeps legacy behavior. If >0, insert t/action after this many MoT layers.')
-
-
-
+                        choices=['mrope', 'mrope_interleave', 'llama1d', 'qwen', 'local', 'last0'],
+                        help='Bridge rotary mode for right-branch QK. `qwen` uses native Qwen3-VL M-RoPE; `mrope` uses Cosmos-aligned 3D RoPE; `llama1d` uses 1-D RoPE.')
     # Freeze
     parser.add_argument('--freeze_video_after', type=int, default=-1,
                         help='Freeze Cosmos when epoch >= this value (0-indexed). 0 = freeze from epoch 0. -1 = never.')
@@ -1580,10 +1591,8 @@ if __name__ == '__main__':
         raise ValueError("state_encoding_mode='mlp' requires state_placeholder_tokens=1 when robot_state is enabled.")
     if args.use_history_trajectory_janus_image not in (0, 1):
         raise ValueError("use_history_trajectory_janus_image must be 0 or 1.")
-    if args.detach_action_cosmos_kv not in (0, 1):
-        raise ValueError("detach_action_cosmos_kv must be 0 or 1.")
-    if args.action_insert_layer < 0 or args.action_insert_layer > 27:
-        raise ValueError("action_insert_layer must be in [0, 27].")
+    if args.right_single_attn_position not in ("first4", "last4"):
+        raise ValueError("right_single_attn_position must be 'first4' or 'last4'.")
     if args.use_latent_hidden_sim_loss not in (0, 1):
         raise ValueError("use_latent_hidden_sim_loss must be 0 or 1.")
     if args.use_latent_hidden_wan_downsample_sim_loss not in (0, 1):

@@ -119,13 +119,14 @@ def normalize_bridge_pos_scheme(bridge_pos_scheme: object) -> str:
         "mrope": "mrope",
         "mrope_interleave": "mrope_interleave",
         "llama1d": "llama1d",
+        "qwen": "qwen",
         "local": "mrope",
         "last0": "mrope",
     }
     if normalized not in alias_map:
         raise ValueError(
             "bridge_pos_scheme must be one of "
-            "'mrope', 'mrope_interleave', 'llama1d', 'local', or 'last0', "
+            "'mrope', 'mrope_interleave', 'llama1d', 'qwen', 'local', or 'last0', "
             f"got {bridge_pos_scheme!r}."
         )
     return alias_map[normalized]
@@ -149,6 +150,7 @@ class BridgeMRoPEBatchInfo:
     latent_valid_mask: Optional[torch.Tensor] = None
     latent_left_pad_lens: Optional[torch.Tensor] = None
     video_grid_thw: Optional[torch.Tensor] = None
+    qwen_position_ids: Optional[torch.Tensor] = None
 
     def to(self, device: torch.device) -> "BridgeMRoPEBatchInfo":
         return BridgeMRoPEBatchInfo(
@@ -170,6 +172,9 @@ class BridgeMRoPEBatchInfo:
             video_grid_thw=None
             if self.video_grid_thw is None
             else self.video_grid_thw.to(device=device, dtype=torch.long),
+            qwen_position_ids=None
+            if self.qwen_position_ids is None
+            else self.qwen_position_ids.to(device=device, dtype=torch.long),
         )
 
 
@@ -809,6 +814,103 @@ class BridgeLlama1DRoPE(BridgeRotaryEncoder):
         while len(self._batch_rotary_cache) > self._max_batch_rotary_cache_entries:
             self._batch_rotary_cache.popitem(last=False)
         return payload
+
+
+class BridgeQwenNativeMRoPE(BridgeRotaryEncoder):
+    """Qwen3-VL native multimodal RoPE for right-branch Q/K tensors."""
+
+    def __init__(self, head_dim: int, janus_rotary_emb: nn.Module):
+        super().__init__(head_dim=head_dim)
+        # Keep a live reference without registering the same rotary module twice.
+        self.__dict__["janus_rotary_emb"] = janus_rotary_emb
+
+    @staticmethod
+    def _normalize_position_ids(
+        position_ids: torch.Tensor,
+        batch_size: int,
+        total_seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        position_ids = position_ids.to(device=device, dtype=torch.long)
+        if position_ids.ndim == 2:
+            if position_ids.shape != (batch_size, total_seq_len):
+                raise ValueError(
+                    "Qwen 1-D fallback position_ids must have shape "
+                    f"{(batch_size, total_seq_len)}, got {tuple(position_ids.shape)}."
+                )
+            return position_ids
+        if position_ids.ndim != 3:
+            raise ValueError(
+                "Qwen native position_ids must be [3,B,L] or [B,3,L], "
+                f"got {tuple(position_ids.shape)}."
+            )
+        if position_ids.shape == (3, batch_size, total_seq_len):
+            return position_ids
+        if position_ids.shape == (batch_size, 3, total_seq_len):
+            return position_ids.permute(1, 0, 2).contiguous()
+        raise ValueError(
+            "Qwen native position_ids shape mismatch: expected "
+            f"{(3, batch_size, total_seq_len)} or {(batch_size, 3, total_seq_len)}, "
+            f"got {tuple(position_ids.shape)}."
+        )
+
+    def _build_cos_sin(
+        self,
+        batch_size: int,
+        seq_len: int,
+        position_ids: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        dummy = torch.empty((batch_size, seq_len, 1, self.head_dim), device=device, dtype=dtype)
+        cos, sin = self.janus_rotary_emb(dummy, position_ids)
+        return cos.to(dtype=dtype).unsqueeze(2), sin.to(dtype=dtype).unsqueeze(2)
+
+    def prepare_batch_rotary(
+        self,
+        batch_info: BridgeMRoPEBatchInfo,
+        batch_size: int,
+        latent_seq_len: int,
+        action_seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> BridgeRotaryPayload:
+        batch_info = batch_info.to(device)
+        total_seq_len = int(latent_seq_len) + int(action_seq_len)
+        if batch_info.qwen_position_ids is None:
+            raise ValueError("bridge_pos_scheme='qwen' requires native Qwen position_ids.")
+        position_ids = self._normalize_position_ids(
+            batch_info.qwen_position_ids,
+            batch_size=batch_size,
+            total_seq_len=total_seq_len,
+            device=device,
+        )
+
+        latent_cos = latent_sin = action_cos = action_sin = None
+        if latent_seq_len > 0:
+            latent_positions = position_ids[..., :latent_seq_len]
+            latent_cos, latent_sin = self._build_cos_sin(
+                batch_size,
+                int(latent_seq_len),
+                latent_positions,
+                device,
+                dtype,
+            )
+        if action_seq_len > 0:
+            action_positions = position_ids[..., latent_seq_len:total_seq_len]
+            action_cos, action_sin = self._build_cos_sin(
+                batch_size,
+                int(action_seq_len),
+                action_positions,
+                device,
+                dtype,
+            )
+        return BridgeRotaryPayload(
+            latent_cos=latent_cos,
+            latent_sin=latent_sin,
+            action_cos=action_cos,
+            action_sin=action_sin,
+        )
 
 
 def _rotate_half_apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:

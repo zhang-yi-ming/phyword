@@ -52,11 +52,12 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-cosmos_trex_mot2_libero_spatial}"
-RUN_NAME="${RUN_NAME:-cosmos2B_trex2B_libero_spatial}"
+RUN_NAME="${RUN_NAME:-cosmos2B&trex2B_libero_spatial}"
 OUTPUT_ROOT_DIR="${OUTPUT_ROOT_DIR:-${LAST05_ROOT}/exp_mot2_trex_action_spatial}"
 
 DATA_JSON="${DATA_JSON:-${DATABASE_ROOT}/data/libero_training_data_last05_lastest/libero_spatial_20hz_224_dual/train_with_atomic_action_shared.json}"
 ACTION_EXPERT_PATH="${ACTION_EXPERT_PATH:-${PRETRAINED_ROOT}/T-Rex_pretrain_mecka22k_epoch1}"
+QWEN3VL2B_MODEL_PATH="${QWEN3VL2B_MODEL_PATH:-/mnt/amlfs-07/shared/physicalword/ckpt/pretraine/Qwen3-VL-2B-Instruct}"
 COSMOS_PT_PATH="${COSMOS_PT_PATH:-${PRETRAINED_ROOT}/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXP_NAME="${COSMOS_EXP_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
 
@@ -76,7 +77,7 @@ NUM_COND_INPUT_FRAMES="${NUM_COND_INPUT_FRAMES:-5}"
 ACTION_DIM="${ACTION_DIM:-7}"
 ACTION_CHUNK="${ACTION_CHUNK:-16}"
 ROBOT_STATE="${ROBOT_STATE:-0}"
-STATE_PLACEHOLDER_TOKENS="${STATE_PLACEHOLDER_TOKENS:-8}"
+STATE_PLACEHOLDER_TOKENS="${STATE_PLACEHOLDER_TOKENS:-1}"
 STATE_DIM="${STATE_DIM:-8}"
 STATE_ENCODING_MODE="${STATE_ENCODING_MODE:-mlp}"
 
@@ -106,11 +107,18 @@ SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT="${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_S
 WAN21_VAE_PATH="${WAN21_VAE_PATH:-${PRETRAINED_ROOT}/wan2.1_vae/original/Wan2.1_VAE.pth}"
 FUTURE_FRAME_STRIDE="${FUTURE_FRAME_STRIDE:-8}"
 BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
-DETACH_ACTION_COSMOS_KV="${DETACH_ACTION_COSMOS_KV:-0}"
-ACTION_INSERT_LAYER="${ACTION_INSERT_LAYER:-0}"
+RIGHT_SINGLE_ATTN_POSITION="${RIGHT_SINGLE_ATTN_POSITION:-first4}"
+DETACH_ACTION_COSMOS_KV="${DETACH_ACTION_COSMOS_KV:-1}"
+
+if [[ -z "$QWEN3VL2B_MODEL_PATH" ]]; then
+  echo "ERROR: QWEN3VL2B_MODEL_PATH must be set for the 32-layer right-branch architecture." >&2
+  exit 1
+fi
 
 echo ">>> Starting 2-MoT Libero training: ${RUN_NAME}"
 echo ">>> Spatial token mode: ${SPATIAL_TOKEN_MODE} count=${TOTAL_SPATIAL_TOKEN_COUNT}"
+echo ">>> Right single-attn position: ${RIGHT_SINGLE_ATTN_POSITION}"
+echo ">>> Detach action Cosmos KV: ${DETACH_ACTION_COSMOS_KV}"
 
 accelerate launch --config_file ../config/sft.yaml \
   --num_processes "${NUM_PROCESSES}" \
@@ -120,6 +128,7 @@ accelerate launch --config_file ../config/sft.yaml \
   --experiment_name "${EXPERIMENT_NAME}" \
   --run_name "${RUN_NAME}" \
   --action_expert_path "${ACTION_EXPERT_PATH}" \
+  --qwen3vl2b_model_path "${QWEN3VL2B_MODEL_PATH}" \
   --cosmos_model_path "${COSMOS_PT_PATH}" \
   --cosmos_experiment_name "${COSMOS_EXP_NAME}" \
   --cosmos_text_cache_path "${COSMOS_TEXT_CACHE_PATH}" \
@@ -159,9 +168,9 @@ accelerate launch --config_file ../config/sft.yaml \
   --latent_hidden_wan_downsample_sim_loss_weight "${SPATIAL_HIDDEN_WAN_DOWNSAMPLE_SIM_LOSS_WEIGHT}" \
   --wan21_vae_path "${WAN21_VAE_PATH}" \
   --bridge_pos_scheme "${BRIDGE_POS_SCHEME}" \
+  --right_single_attn_position "${RIGHT_SINGLE_ATTN_POSITION}" \
   --detach_action_cosmos_kv "${DETACH_ACTION_COSMOS_KV}" \
-  --action_insert_layer "${ACTION_INSERT_LAYER}" \
-  --freeze_video_after "${FREEZE_VIDEO_AFTER:-100}" \
+  --freeze_video_after "${FREEZE_VIDEO_AFTER:--1}" \
   --robot_state "${ROBOT_STATE}" \
   --state_placeholder_tokens "${STATE_PLACEHOLDER_TOKENS}" \
   --state_dim "${STATE_DIM}" \

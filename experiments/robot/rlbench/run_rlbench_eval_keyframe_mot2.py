@@ -157,7 +157,8 @@ class EvalConfig:
     bridge_pos_scheme: str = "mrope"
     action_use_latent_prefix: bool = True
     action_self_causal_in_bridge: bool = True
-    action_insert_layer: int = 0
+    qwen3vl2b_model_path: str = "/mnt/amlfs-07/shared/physicalword/ckpt/pretraine/Qwen3-VL-2B-Instruct"
+    right_single_attn_position: str = "last4"
     action_denoise_steps: int = 10
     cosmos_denoise_steps: int = 2
     fps: float = 20.0
@@ -254,13 +255,10 @@ def resolve_special_token_init_ids(tokenizer, special_token_vocab: list[str]) ->
 
 def validate_special_token_checkpoint_rows(state_dict: dict[str, Any], special_token_vocab: list[str]) -> None:
     expected = len(special_token_vocab)
-    row_keys = [
-        "special_token_embedding.weight",
-        "special_token_lm_head.weight",
-    ]
+    row_keys = ["special_token_embedding.weight"]
     missing = [key for key in row_keys if key not in state_dict]
     if missing:
-        raise ValueError(f"Checkpoint is missing independent special-token weights: {missing}")
+        raise ValueError(f"Checkpoint is missing tied special-token weights: {missing}")
     mismatches = []
     for key in row_keys:
         rows = int(state_dict[key].shape[0])
@@ -494,9 +492,9 @@ def model_load(cfg: EvalConfig):
     cfg.use_value_prediction = False
     cfg.use_action_value_prediction = False
     cfg.total_spatial_tokens = int(cfg.total_latent_tokens)
-    logger.info("Resolved action_insert_layer=%s", int(getattr(cfg, "action_insert_layer", 0) or 0))
+    logger.info("Resolved right_single_attn_position=%s", getattr(cfg, "right_single_attn_position", "last4"))
     ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
-    processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
+    processor = load_processor_for_checkpoint(cfg.qwen3vl2b_model_path or cfg.action_model_path or cfg.model_path, base_dir)
     tokenizer = processor.tokenizer
     action_tokenizer = None
     cfg.janus_image_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -504,7 +502,17 @@ def model_load(cfg: EvalConfig):
     cfg.latent_end_id = tokenizer.eos_token_id
     cfg.trex_image_token_id = int(tokenizer.convert_tokens_to_ids("<|image_pad|>"))
 
-    janus_model, _ = TrexActionModel.from_checkpoint(
+    if not str(cfg.qwen3vl2b_model_path or "").strip():
+        raise ValueError("--qwen3vl2b_model_path is required for the 32-layer right-branch architecture.")
+    janus_model, _ = TrexActionModel.from_qwen3vl_checkpoint(
+        cfg.qwen3vl2b_model_path,
+        action_dim=cfg.action_dim,
+        action_chunk=cfg.action_chunk,
+        torch_dtype=torch.bfloat16,
+        use_robot_state=bool(cfg.robot_state),
+        verbose=True,
+    )
+    trex_action_model, _ = TrexActionModel.from_checkpoint(
         cfg.action_model_path,
         action_dim=cfg.action_dim,
         action_chunk=cfg.action_chunk,
@@ -512,6 +520,8 @@ def model_load(cfg: EvalConfig):
         use_robot_state=bool(cfg.robot_state),
         verbose=True,
     )
+    janus_model.transplant_action_components_from(trex_action_model, fast_layer_count=4)
+    del trex_action_model
 
     import cosmos_predict2._src.predict2.models.text2world_model_rectified_flow as t2w_module
 
@@ -1019,8 +1029,9 @@ def parse_args() -> EvalConfig:
     cfg.action_self_causal_in_bridge = True
     cfg.use_value_prediction = False
     cfg.use_action_value_prediction = False
-    if int(cfg.action_insert_layer) < 0 or int(cfg.action_insert_layer) > 27:
-        raise ValueError("action_insert_layer must be in [0, 27].")
+    cfg.right_single_attn_position = str(getattr(cfg, "right_single_attn_position", "last4") or "last4").lower()
+    if cfg.right_single_attn_position not in ("first4", "last4"):
+        raise ValueError("right_single_attn_position must be 'first4' or 'last4'.")
     if int(cfg.total_latent_tokens) not in (1, 2):
         raise ValueError(
             f"Beta token-latent RLBench eval requires total_latent_tokens=1 or 2, got {cfg.total_latent_tokens}."

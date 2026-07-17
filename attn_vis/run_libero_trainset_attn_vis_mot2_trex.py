@@ -28,37 +28,46 @@ if project_root_str in sys.path:
     sys.path.remove(project_root_str)
 sys.path.insert(0, project_root_str)
 
-from attn_vis.run_rlbench_trainset_attn_vis_mot2_trex import (  # noqa: E402
-    DEFAULT_SPECIAL_TOKEN_VOCAB,
+from attn_vis.common import (  # noqa: E402
     PrintAccelerator,
     action_summary,
     coerce_bool,
     log_message,
-    model_load,
     move_batch_to_device,
     resolve_spatial_token_args,
     set_seed,
-    _draw_text_with_outline,
-    _overlay_heatmap,
-    _sanitize_filename,
-    _score_to_rgb,
+    overlay_heatmap as _overlay_heatmap,
+    sanitize_filename as _sanitize_filename,
+    score_to_rgb as _score_to_rgb,
 )
+from attn_vis.run_rlbench_trainset_attn_vis_mot2_trex import model_load  # noqa: E402
 from scripts.train_mot2_trex import VLACotDataset  # noqa: E402
+from utils.model_config_manifest import load_model_manifest, validate_runtime_model_config  # noqa: E402
 
 
+DEFAULT_SPECIAL_TOKEN_VOCAB = [
+    "</MOVE>",
+    "</BOWWL>",
+    "</PICK>",
+    "</PLACE>",
+    "</APPROACH>",
+    "</bowl>",
+]
+
+
+# label, latent start, latent end, representative-frame label, frame offset from t.
 SLICE_SPECS = (
-    ("slice0_t-4", 0, 1, "t-4"),
-    ("slice1_t-3_to_t", 1, 2, "t-3"),
-    ("slice2_t+1_to_t+4", 2, 3, "t+1"),
-    ("slice3_t+5_to_t+8", 3, 4, "t+5"),
-    ("slice4_t+9_to_t+12", 4, 5, "t+9"),
+    ("slice0_t-4", 0, 1, "t-4", -4),
+    ("slice1_t-3_to_t", 1, 2, "t-2", -2),
+    ("slice2_t+1_to_t+4", 2, 3, "t+2", 2),
+    ("slice3_t+5_to_t+8", 3, 4, "t+6", 6),
+    ("slice4_t+9_to_t+12", 4, 5, "t+10", 10),
 )
 
 
 @dataclass
 class LiberoTrainsetAttnVisConfig:
     pretrained_checkpoint: str = ""
-    model_path: str = "/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1"
     action_model_path: str = "/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1"
     cosmos_model_path: str = (
         "/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/"
@@ -97,33 +106,19 @@ class LiberoTrainsetAttnVisConfig:
     action_dim: int = 7
     action_chunk: int = 16
     robot_state: int = 0
-    state_placeholder_tokens: int = 8
+    state_placeholder_tokens: int = 1
     state_dim: int = 8
     state_encoding_mode: str = "mlp"
     total_latent_tokens: str = ""
     latent_token_mode: str = ""
     special_token_vocab: str = ",".join(DEFAULT_SPECIAL_TOKEN_VOCAB)
-    img_latents_per_future: int = 0
-    state_latents_per_future: int = 0
-    num_future_frames: int = 0
-    future_frame_stride: int = 8
-    use_latent_hidden_sim_loss: int = 0
-    latent_hidden_sim_loss_mode: str = "siglip"
-    latent_hidden_sim_pool_mode: str = "pool"
-    latent_hidden_sim_loss_weight: float = 1.0
-    use_latent_hidden_wan_downsample_sim_loss: int = 0
-    latent_hidden_wan_downsample_sim_loss_weight: float = 1.0
-    wan21_vae_path: str = "/mnt/nas/zhangyiming/database/ckpt/pretrained/wan2.1_vae/original/Wan2.1_VAE.pth"
-    cosmos_self_only_bridge: bool = False
-    decosmos: bool = False
+    special_token_weight_tied: bool = True
     bridge_pos_scheme: str = "mrope"
-    action_use_latent_prefix: bool = True
-    action_self_causal_in_bridge: bool = True
-    action_insert_layer: int = 0
-    detach_action_cosmos_kv: int = 0
+    qwen3vl2b_model_path: str = "/mnt/amlfs-07/shared/physicalword/ckpt/pretraine/Qwen3-VL-2B-Instruct"
+    right_single_attn_position: str = "first4"
     action_denoise_steps: int = 10
     cosmos_denoise_steps: int = 2
-    fps: float = 10.0
+    fps: float = 20.0
     empty_cache_every: int = 10
 
 
@@ -135,8 +130,6 @@ def parse_args() -> LiberoTrainsetAttnVisConfig:
         parser.add_argument(f"--{field_def.name}", default=default, type=arg_type)
     ns = parser.parse_args()
     cfg = LiberoTrainsetAttnVisConfig(**vars(ns))
-    for name in ("cosmos_self_only_bridge", "decosmos", "action_use_latent_prefix", "action_self_causal_in_bridge"):
-        setattr(cfg, name, coerce_bool(getattr(cfg, name)))
     top_ratio = cfg.attention_visualization_top_ratio
     if top_ratio is None or (isinstance(top_ratio, str) and top_ratio.strip() == ""):
         cfg.attention_visualization_top_ratio = None
@@ -148,9 +141,9 @@ def parse_args() -> LiberoTrainsetAttnVisConfig:
     cfg.attention_visualization_top_softness = float(cfg.attention_visualization_top_softness)
     if not 0.0 <= cfg.attention_visualization_top_softness <= 1.0:
         raise ValueError("--attention_visualization_top_softness must be in [0, 1].")
-    cfg.action_insert_layer = int(getattr(cfg, "action_insert_layer", 0) or 0)
-    if cfg.action_insert_layer < 0 or cfg.action_insert_layer > 27:
-        raise ValueError("action_insert_layer must be in [0, 27].")
+    cfg.right_single_attn_position = str(getattr(cfg, "right_single_attn_position", "first4") or "first4").lower()
+    if cfg.right_single_attn_position not in ("first4", "last4"):
+        raise ValueError("right_single_attn_position must be 'first4' or 'last4'.")
     resolve_spatial_token_args(cfg)
     if isinstance(cfg.special_token_vocab, str):
         special_token_vocab = [
@@ -166,15 +159,33 @@ def parse_args() -> LiberoTrainsetAttnVisConfig:
     cfg.special_token_to_id = {
         token: idx for idx, token in enumerate(special_token_vocab)
     }
-    cfg.latent_hidden_sim_pool_mode = str(getattr(cfg, "latent_hidden_sim_pool_mode", "pool") or "pool").lower()
-    if cfg.latent_hidden_sim_pool_mode not in ("pool", "one_mlp", "mlp"):
-        raise ValueError("latent_hidden_sim_pool_mode must be 'pool', 'one_mlp', or 'mlp'.")
-    cfg.spatial_hidden_sim_pool_mode = cfg.latent_hidden_sim_pool_mode
+    cfg.special_token_weight_tied = coerce_bool(cfg.special_token_weight_tied)
+    if not cfg.special_token_weight_tied:
+        raise ValueError("This model version requires special_token_weight_tied=true.")
     return cfg
 
 
+class LiberoAttentionDataset(VLACotDataset):
+    """Training-record dataset that decodes only real Cosmos history frames."""
+
+    def _load_video(self, video_path, frame_idx):
+        target_frames = int(self.config.num_cond_input_frames)
+        start_frame = int(frame_idx) - (target_frames - 1)
+        video_path = self._resolve_data_path(video_path)
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total_frames = len(vr)
+        if total_frames <= 0:
+            raise ValueError(f"Video has no frames: {video_path}")
+        indices = np.arange(start_frame, start_frame + target_frames)
+        indices = np.clip(indices, 0, total_frames - 1)
+        frames = vr.get_batch(indices).asnumpy()
+        frames_tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0
+        frames_tensor = self.video_transform(frames_tensor)
+        return frames_tensor.permute(1, 0, 2, 3)
+
+
 def build_dataset(cfg: LiberoTrainsetAttnVisConfig, processor, log_file=None) -> VLACotDataset:
-    return VLACotDataset(cfg, processor, PrintAccelerator(log_file))
+    return LiberoAttentionDataset(cfg, processor, PrintAccelerator(log_file))
 
 
 def parse_episode_index(video_path: str, fallback: int) -> int:
@@ -242,15 +253,22 @@ def load_cosmos_slice_base_images(
     cfg: LiberoTrainsetAttnVisConfig,
 ) -> list[Image.Image]:
     frame_idx = int(sample.get("frame_index", 0))
-    start_frame = frame_idx - (int(cfg.num_cond_input_frames) - 1)
     images = []
-    for _, frame_offset, _, _ in SLICE_SPECS:
-        images.append(load_libero_frame(dataset, sample["video_path"], start_frame + int(frame_offset)))
+    for _, _, _, _, frame_offset in SLICE_SPECS:
+        images.append(load_libero_frame(dataset, sample["video_path"], frame_idx + int(frame_offset)))
     return images
 
 
 class LiberoAttentionMapRecorder:
-    def __init__(self, cfg: LiberoTrainsetAttnVisConfig, num_layers: int, log_file=None):
+    def __init__(
+        self,
+        cfg: LiberoTrainsetAttnVisConfig,
+        *,
+        right_layer_count: int,
+        slow_layer_indices: list[int],
+        action_layer_indices: list[int],
+        log_file=None,
+    ):
         self.cfg = cfg
         self.log_file = log_file
         self.output_dir = str(getattr(cfg, "attention_visualization_dir", "") or "").strip()
@@ -258,14 +276,23 @@ class LiberoAttentionMapRecorder:
         self.spatial_token_count = int(getattr(cfg, "total_latent_tokens", 1) or 1)
         if self.spatial_token_count not in (1, 2):
             raise ValueError(f"Expected total_latent_tokens=1 or 2, got {self.spatial_token_count}.")
-        self.slow_labels = ["v_prev", "v"] if self.spatial_token_count == 1 else ["v_prev", "v", "n"]
-        self.num_layers = int(num_layers)
-        self.slow_layer_count = self.num_layers
-        self.first_action_layer_idx = int(getattr(cfg, "action_insert_layer", 0) or 0)
-        if self.first_action_layer_idx < 0 or self.first_action_layer_idx >= self.num_layers:
+        if self.spatial_token_count == 1:
+            self.slow_labels = ["context", str(getattr(cfg, "latent_token_mode", "v"))]
+        else:
+            self.slow_labels = ["context", "v", "n"]
+        self.num_layers = int(right_layer_count)
+        self.slow_layer_indices = tuple(int(idx) for idx in slow_layer_indices)
+        self.action_layer_indices = tuple(int(idx) for idx in action_layer_indices)
+        if not self.slow_layer_indices:
+            raise ValueError("No paired prefix layers are available for Cosmos attention visualization.")
+        if not self.action_layer_indices:
             raise ValueError(
-                f"action_insert_layer must be in [0, {self.num_layers - 1}], got {self.first_action_layer_idx}."
+                "No paired T-Rex action layers are available. "
+                "Use right_single_attn_position='first4' for action-to-Cosmos attention visualization."
             )
+        self._slow_layer_index_set = set(self.slow_layer_indices)
+        self._action_layer_index_set = set(self.action_layer_indices)
+        self.first_action_layer_idx = self.action_layer_indices[0]
         self.alpha = float(getattr(cfg, "attention_visualization_alpha", 0.45) or 0.45)
         self.tile_size = max(16, int(getattr(cfg, "attention_visualization_tile_size", 160) or 160))
         self.top_ratio = getattr(cfg, "attention_visualization_top_ratio", None)
@@ -273,8 +300,11 @@ class LiberoAttentionMapRecorder:
         self.gap = max(0, int(getattr(cfg, "attention_visualization_gap", 8) or 0))
         self.header_h = max(16, int(getattr(cfg, "attention_visualization_header_height", 24) or 24))
         self.capture_mode = str(getattr(cfg, "attention_visualization_capture_mode", "last") or "last").lower()
-        if self.capture_mode not in {"all", "first", "last"}:
-            raise ValueError(f"attention_visualization_capture_mode must be all/first/last, got {self.capture_mode!r}.")
+        if self.capture_mode not in {"first", "last"}:
+            raise ValueError(
+                "attention_visualization_capture_mode must be first/last; "
+                f"got {self.capture_mode!r}."
+            )
         self.active = False
         self.slice_base_images: list[Image.Image] = []
         self.metadata = {}
@@ -383,10 +413,12 @@ class LiberoAttentionMapRecorder:
         if t != len(SLICE_SPECS) or h != 16 or w != 16:
             raise ValueError(f"Expected Cosmos video grid 5x16x16, got {t}x{h}x{w} for video_len={video_len}.")
         records = {}
-        for slice_label, start_t, end_t, base_label in SLICE_SPECS:
+        for slice_label, start_t, end_t, base_label, _ in SLICE_SPECS:
             start = int(start_t) * h * w
             end = int(end_t) * h * w
             region_attn = full_attn[:, start:end]
+            # Keep the scalar slice mass globally comparable, but normalize
+            # colors within each slice so its spatial pattern remains visible.
             score = float(region_attn.sum(dim=-1).mean().detach().cpu().item())
             region_scores = scores[:, :, start:end]
             local = torch.softmax(region_scores, dim=-1).mean(dim=(0, 1)).detach().to(torch.float32).cpu()
@@ -456,7 +488,7 @@ class LiberoAttentionMapRecorder:
         if not self.active:
             return
         layer_idx = int(layer_idx)
-        if layer_idx < 0 or layer_idx >= self.slow_layer_count:
+        if layer_idx not in self._slow_layer_index_set:
             return
         if action_valid_mask is None:
             selected_count = len(self.slow_labels)
@@ -503,7 +535,7 @@ class LiberoAttentionMapRecorder:
         if not self.active:
             return
         layer_idx = int(layer_idx)
-        if layer_idx < self.first_action_layer_idx or layer_idx >= self.num_layers:
+        if layer_idx not in self._action_layer_index_set:
             return
         if layer_idx == self.first_action_layer_idx:
             self.action_denoise_step += 1
@@ -610,8 +642,8 @@ class LiberoAttentionMapRecorder:
     def _save_query(self) -> list[str]:
         slow_labels = list(self.slow_labels)
         action_labels = [f"action{i:02d}" for i in range(self.action_chunk)]
-        slow_layers = range(0, self.slow_layer_count)
-        action_layers = range(self.first_action_layer_idx, self.num_layers)
+        slow_layers = self.slow_layer_indices
+        action_layers = self.action_layer_indices
         self._validate_records(self.slow_records, slow_labels, slow_layers, "slow")
         self._validate_records(self.action_records, action_labels, action_layers, "action")
         query_dir = self._query_dir()
@@ -620,7 +652,10 @@ class LiberoAttentionMapRecorder:
             records=self.slow_records,
             query_labels=slow_labels,
             layers=slow_layers,
-            title=f"slow prefix: {'/'.join(slow_labels)} -> Cosmos slices (layers 0-{self.slow_layer_count - 1})",
+            title=(
+                f"slow prefix: {'/'.join(slow_labels)} -> Cosmos slices "
+                f"(right layers {self.slow_layer_indices[0]}-{self.slow_layer_indices[-1]})"
+            ),
         )
         action_img = self._render_summary(
             records=self.action_records,
@@ -628,7 +663,7 @@ class LiberoAttentionMapRecorder:
             layers=action_layers,
             title=(
                 f"action denoise step {self._target_action_step()}: action00-action{self.action_chunk - 1:02d} "
-                f"-> Cosmos slices (layers {self.first_action_layer_idx}-{self.num_layers - 1})"
+                f"-> Cosmos slices (right layers {self.action_layer_indices[0]}-{self.action_layer_indices[-1]})"
             ),
         )
         slow_path = self._output_path("slow_summary")
@@ -644,144 +679,127 @@ def install_attention_map_recorder(model, cfg: LiberoTrainsetAttnVisConfig, log_
     output_dir = str(getattr(cfg, "attention_visualization_dir", "") or "").strip()
     if not output_dir:
         return None
-    wrappers = getattr(model, "mot_attention_wrappers", None)
-    if wrappers is None or len(wrappers) == 0:
-        raise AttributeError("Model has no mot_attention_wrappers to instrument for attention visualization.")
-    recorder = LiberoAttentionMapRecorder(cfg, num_layers=len(wrappers), log_file=log_file)
+    if str(getattr(model, "right_single_attn_position", "")) != "first4":
+        raise ValueError(
+            "Libero action-to-Cosmos visualization requires right_single_attn_position='first4'. "
+            "With last4, the four T-Rex action layers are standalone and have no Cosmos K/V."
+        )
 
-    def make_patched_forward_action_prefix_and_cache(layer_idx: int):
-        def patched_forward_action_prefix_and_cache(
+    right_layer_specs = getattr(model, "right_layer_specs", None)
+    right_layers = getattr(model, "right_layers", None)
+    prefix_layer_count = int(getattr(model, "prefix_layer_count", 0) or 0)
+    right_layer_count = int(getattr(model, "right_layer_count", 0) or 0)
+    if not right_layer_specs or right_layers is None or len(right_layer_specs) != right_layer_count:
+        raise AttributeError("Model does not expose a complete right-layer topology for attention visualization.")
+
+    paired_prefix_layers = [
+        int(spec["right_idx"])
+        for spec in right_layer_specs
+        if spec["kind"] == "paired" and int(spec["right_idx"]) < prefix_layer_count
+    ]
+    paired_action_layers = [
+        int(spec["right_idx"])
+        for spec in right_layer_specs
+        if spec["kind"] == "paired" and int(spec["right_idx"]) >= prefix_layer_count
+    ]
+    recorder = LiberoAttentionMapRecorder(
+        cfg,
+        right_layer_count=right_layer_count,
+        slow_layer_indices=paired_prefix_layers,
+        action_layer_indices=paired_action_layers,
+        log_file=log_file,
+    )
+
+    def make_patched_forward_action_only(right_idx: int):
+        def patched_forward_action_only(
             self,
             x_action: torch.Tensor,
             action_valid_mask: Optional[torch.Tensor] = None,
             rotary_payload=None,
             action_tail_token_count: int = 0,
-            append_to_cache: bool = False,
         ) -> torch.Tensor:
             if self.cached_k_v is None or self.cached_v_v is None:
-                raise RuntimeError("forward_action_prefix_and_cache requires cached Cosmos KV from run_cosmos_once().")
+                raise RuntimeError("forward_action_only requires cached Cosmos KV from run_cosmos_once().")
+
             q_a, k_a, v_a = self.action_bridge.get_branch_qkv(x_action)
             q_a, k_a = self._apply_action_rotary(q_a, k_a, rotary_payload)
-            S_v = self.cached_k_v.shape[1]
-            S_a = q_a.shape[1]
-            if append_to_cache and self.cached_k_a_prefix is not None:
-                prefix_len = self.cached_k_a_prefix.shape[1]
-                k_action_full = torch.cat([self.cached_k_a_prefix, k_a], dim=1)
-                k = torch.cat([self.cached_k_v, k_action_full], dim=1)
-                v = torch.cat([self.cached_v_v, self.cached_v_a_prefix, v_a], dim=1)
-                mask = self._build_action_cached_suffix_mask(
-                    S_v,
-                    prefix_len,
-                    S_a,
-                    q_a.device,
-                    prefix_valid_mask=self.cached_action_prefix_valid_mask,
-                    suffix_valid_mask=action_valid_mask,
-                    action_tail_token_count=action_tail_token_count,
+            video_len = int(self.cached_k_v.shape[1])
+            action_len = int(q_a.shape[1])
+            k = torch.cat([self.cached_k_v, k_a], dim=1)
+            v = torch.cat([self.cached_v_v, v_a], dim=1)
+            mask = self._build_action_only_mask(
+                video_len,
+                action_len,
+                q_a.device,
+                action_valid_mask=action_valid_mask,
+                action_tail_token_count=action_tail_token_count,
+            )
+
+            tail_count = int(action_tail_token_count or 0)
+            if tail_count > 0:
+                if tail_count != recorder.action_chunk:
+                    raise ValueError(
+                        f"Expected {recorder.action_chunk} action-tail queries, got {tail_count}."
+                    )
+                recorder.capture_action_attention(
+                    layer_idx=right_idx,
+                    q_tokens=q_a[:, -tail_count:, :, :],
+                    k_video=self.cached_k_v,
+                    k_action=k_a,
+                    allowed_mask=mask[0, 0, -tail_count:, :],
+                    video_grid_thw=self.cached_video_grid_thw,
                 )
             else:
-                k_action_full = k_a
-                k = torch.cat([self.cached_k_v, k_a], dim=1)
-                v = torch.cat([self.cached_v_v, v_a], dim=1)
-                mask = self._build_action_only_mask(
-                    S_v,
-                    S_a,
-                    q_a.device,
-                    action_valid_mask=action_valid_mask,
-                    action_tail_token_count=action_tail_token_count,
-                )
                 recorder.capture_slow_attention(
-                    layer_idx=layer_idx,
+                    layer_idx=right_idx,
                     q_tokens=q_a,
                     k_video=self.cached_k_v,
-                    k_action=k_action_full,
+                    k_action=k_a,
                     allowed_mask=mask[0, 0],
                     action_valid_mask=action_valid_mask,
                     video_grid_thw=self.cached_video_grid_thw,
                 )
+
             query_valid_mask = action_valid_mask
             if query_valid_mask is None:
-                query_valid_mask = torch.ones((q_a.shape[0], S_a), device=q_a.device, dtype=torch.bool)
-            result = self._bridge_sdpa(q_a, k, v, attn_mask=mask, query_valid_mask=query_valid_mask)
-            out = self.action_bridge.post_attention(x_action, result, token_valid_mask=action_valid_mask)
-            if append_to_cache:
-                k_store = k_a.detach()
-                v_store = v_a.detach()
-                valid_store = query_valid_mask.detach().clone()
-                if self.cached_k_a_prefix is None:
-                    self.cached_k_a_prefix = k_store
-                    self.cached_v_a_prefix = v_store
-                    self.cached_action_prefix_valid_mask = valid_store
-                else:
-                    self.cached_k_a_prefix = torch.cat([self.cached_k_a_prefix, k_store], dim=1)
-                    self.cached_v_a_prefix = torch.cat([self.cached_v_a_prefix, v_store], dim=1)
-                    self.cached_action_prefix_valid_mask = torch.cat([self.cached_action_prefix_valid_mask, valid_store], dim=1)
-            return out
-
-        return patched_forward_action_prefix_and_cache
-
-    def make_patched_forward_action_suffix_only(layer_idx: int):
-        def patched_forward_action_suffix_only(
-            self,
-            x_action_suffix: torch.Tensor,
-            suffix_valid_mask: Optional[torch.Tensor] = None,
-            rotary_payload=None,
-            action_tail_token_count: int = 0,
-        ) -> torch.Tensor:
-            if self.cached_k_v is None or self.cached_v_v is None:
-                raise RuntimeError("forward_action_suffix_only requires cached Cosmos KV from run_cosmos_once().")
-            if self.cached_k_a_prefix is None or self.cached_v_a_prefix is None:
-                raise RuntimeError("forward_action_suffix_only requires cached action prefix KV.")
-            q_a, k_a, v_a = self.action_bridge.get_branch_qkv(x_action_suffix)
-            q_a, k_a = self._apply_action_rotary(q_a, k_a, rotary_payload)
-            S_v = self.cached_k_v.shape[1]
-            S_prefix = self.cached_k_a_prefix.shape[1]
-            S_suffix = q_a.shape[1]
-            k_action_full = torch.cat([self.cached_k_a_prefix, k_a], dim=1)
-            k = torch.cat([self.cached_k_v, k_action_full], dim=1)
-            v = torch.cat([self.cached_v_v, self.cached_v_a_prefix, v_a], dim=1)
-            mask = self._build_action_cached_suffix_mask(
-                S_v,
-                S_prefix,
-                S_suffix,
-                q_a.device,
-                prefix_valid_mask=self.cached_action_prefix_valid_mask,
-                suffix_valid_mask=suffix_valid_mask,
-                action_tail_token_count=action_tail_token_count,
+                query_valid_mask = torch.ones(
+                    (q_a.shape[0], action_len),
+                    device=q_a.device,
+                    dtype=torch.bool,
+                )
+            result = self._bridge_sdpa(
+                q_a,
+                k,
+                v,
+                attn_mask=mask,
+                query_valid_mask=query_valid_mask,
             )
-            query_valid_mask = suffix_valid_mask
-            if query_valid_mask is None:
-                query_valid_mask = torch.ones((q_a.shape[0], S_suffix), device=q_a.device, dtype=torch.bool)
-            expected = 1 + int(recorder.action_chunk)
-            if int(q_a.shape[1]) != expected:
-                raise ValueError(f"Expected suffix queries time+{recorder.action_chunk} actions={expected}, got {q_a.shape[1]}.")
-            recorder.capture_action_attention(
-                layer_idx=layer_idx,
-                q_tokens=q_a[:, 1:, :, :],
-                k_video=self.cached_k_v,
-                k_action=k_action_full,
-                allowed_mask=mask[0, 0, 1:, :],
-                video_grid_thw=self.cached_video_grid_thw,
+            return self.action_bridge.post_attention(
+                x_action,
+                result,
+                token_valid_mask=action_valid_mask,
             )
-            result = self._bridge_sdpa(q_a, k, v, attn_mask=mask, query_valid_mask=query_valid_mask)
-            return self.action_bridge.post_attention(x_action_suffix, result, token_valid_mask=suffix_valid_mask)
 
-        return patched_forward_action_suffix_only
+        return patched_forward_action_only
 
-    for layer_idx, wrapper in enumerate(wrappers):
-        if not hasattr(wrapper, "_libero_trex_attn_vis_original_forward_action_prefix_and_cache"):
-            wrapper._libero_trex_attn_vis_original_forward_action_prefix_and_cache = wrapper.forward_action_prefix_and_cache
-            wrapper.forward_action_prefix_and_cache = types.MethodType(
-                make_patched_forward_action_prefix_and_cache(layer_idx),
+    for spec in right_layer_specs:
+        if spec["kind"] != "paired":
+            continue
+        right_idx = int(spec["right_idx"])
+        wrapper = right_layers[right_idx]
+        if not hasattr(wrapper, "_libero_trex_attn_vis_original_forward_action_only"):
+            wrapper._libero_trex_attn_vis_original_forward_action_only = wrapper.forward_action_only
+            wrapper.forward_action_only = types.MethodType(
+                make_patched_forward_action_only(right_idx),
                 wrapper,
             )
-        if not hasattr(wrapper, "_libero_trex_attn_vis_original_forward_action_suffix_only"):
-            wrapper._libero_trex_attn_vis_original_forward_action_suffix_only = wrapper.forward_action_suffix_only
-            wrapper.forward_action_suffix_only = types.MethodType(make_patched_forward_action_suffix_only(layer_idx), wrapper)
 
     model._libero_trex_attention_map_recorder = recorder
     log_message(
-        f"Installed Libero T-Rex MoT2 attention recorder: dir={output_dir}, layers={len(wrappers)}, "
-        f"action_insert_layer={recorder.first_action_layer_idx}, action_layers={len(range(recorder.first_action_layer_idx, recorder.num_layers))}, "
+        f"Installed Libero T-Rex MoT2 attention recorder: dir={output_dir}, "
+        f"right_single_attn_position={cfg.right_single_attn_position}, "
+        f"slow_right_layers={list(recorder.slow_layer_indices)}, "
+        f"action_right_layers={list(recorder.action_layer_indices)}, "
         f"action_chunk={cfg.action_chunk}, capture_mode={cfg.attention_visualization_capture_mode}, tile={recorder.tile_size}, gap={recorder.gap}",
         log_file,
     )
@@ -819,6 +837,13 @@ def run_selected_records(
             cosmos_text_embeddings = batch.get("cosmos_text_embeddings")
             if cosmos_text_embeddings is not None:
                 cosmos_text_embeddings = cosmos_text_embeddings.to(device=device, dtype=dtype)
+            condition_frame_count = int(cfg.num_cond_input_frames)
+            condition_frames = batch["videos"][:, :, :condition_frame_count]
+            if int(condition_frames.shape[2]) != condition_frame_count:
+                raise ValueError(
+                    f"Expected {condition_frame_count} Cosmos history frames, "
+                    f"got shape={tuple(condition_frames.shape)}."
+                )
             recorder.start_query(
                 slice_base_images=slice_base_images,
                 task_name=task_name,
@@ -837,7 +862,9 @@ def run_selected_records(
                         janus_image_grid_thw=batch["janus_image_grid_thw"],
                         janus_images_seq_mask=batch["janus_images_seq_mask"],
                         janus_images_emb_mask=batch["janus_images_emb_mask"],
-                        first_frame=batch["videos"],
+                        # Pass only t-4..t. The model initializes all future
+                        # latent frames from random noise before Cosmos denoising.
+                        first_frame=condition_frames,
                         action_denoise_steps=int(cfg.action_denoise_steps),
                         cosmos_denoise_steps=int(cfg.cosmos_denoise_steps),
                         fps=torch.tensor([float(cfg.fps)], device=device, dtype=dtype),
@@ -853,11 +880,18 @@ def run_selected_records(
                         cosmos_janus_images_emb_mask=batch["cosmos_janus_images_emb_mask"],
                         now_state=now_state,
                         cosmos_text_embeddings=cosmos_text_embeddings,
+                        decode_video=False,
+                        return_spatial_debug=True,
                     )
-                pred_video, pred_action = outputs[:2]
+                pred_video, pred_action, spatial_debug = outputs
                 del pred_video
                 saved_paths = recorder.finish_query()
                 summary = action_summary(pred_action)
+                spatial_token_ids = [
+                    int(token_id)
+                    for token_id in spatial_debug["spatial_token_ids"].detach().cpu().reshape(-1).tolist()
+                ]
+                spatial_tokens = [cfg.special_token_vocab[token_id] for token_id in spatial_token_ids]
                 trace_file.write(
                     json.dumps(
                         {
@@ -867,6 +901,9 @@ def run_selected_records(
                             "sample_index": int(sample_index),
                             "frame_index": int(frame_index),
                             "prompt": prompt,
+                            "cosmos_condition_frames": condition_frame_count,
+                            "spatial_token_ids": spatial_token_ids,
+                            "spatial_tokens": spatial_tokens,
                             "saved_attention_paths": saved_paths,
                             "pred_action": summary,
                         },
@@ -875,6 +912,7 @@ def run_selected_records(
                     + "\n"
                 )
                 trace_file.flush()
+                log_message(f"Spatial tokens: {spatial_tokens}", log_file)
                 log_message(f"Action summary: {json.dumps(summary, sort_keys=True)}", log_file)
             except Exception:
                 recorder.discard_query()
@@ -898,6 +936,10 @@ def main() -> None:
         )
     if int(cfg.action_chunk) != 16:
         raise ValueError(f"Libero action visualization expects action_chunk=16, got {cfg.action_chunk}.")
+    if cfg.right_single_attn_position != "first4":
+        raise ValueError(
+            "Libero action-to-Cosmos visualization requires right_single_attn_position='first4'."
+        )
     Path(str(cfg.attention_visualization_dir)).mkdir(parents=True, exist_ok=True)
     log_path = Path(str(cfg.attention_visualization_dir)) / "libero_trainset_attn_vis.log"
     with log_path.open("a", encoding="utf-8") as log_file:
@@ -909,6 +951,20 @@ def main() -> None:
         np.random.seed(int(cfg.seed))
         set_seed(int(cfg.seed))
         model, processor, _statistic = model_load(cfg, log_file)
+        set_seed(int(cfg.seed))
+        cfg.special_token_to_id = {
+            token: idx for idx, token in enumerate(cfg.special_token_vocab)
+        }
+        checkpoint_path = Path(str(cfg.pretrained_checkpoint))
+        checkpoint_dir = checkpoint_path if checkpoint_path.is_dir() else checkpoint_path.parent
+        model_manifest = load_model_manifest(str(checkpoint_dir))
+        if model_manifest is None:
+            log_message(
+                "Checkpoint has no model_config.json; reconstructing topology from runtime arguments.",
+                log_file,
+            )
+        else:
+            validate_runtime_model_config(cfg, model_manifest)
         recorder = install_attention_map_recorder(model, cfg, log_file)
         if recorder is None:
             raise RuntimeError("Attention recorder was not installed.")

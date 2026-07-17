@@ -26,6 +26,7 @@ from models.cosmos_janus_cot import (
     BridgeA1MRoPE,
     BridgeLlama1DRoPE,
     BridgeMRoPEBatchInfo,
+    BridgeQwenNativeMRoPE,
     BridgeRotaryEncoder,
     BridgeRotaryPayload,
     LatentNativeAttentionAdapter,
@@ -34,22 +35,96 @@ from models.cosmos_janus_cot import (
 )
 
 
-class ActionStandardAttentionAdapter(LatentNativeAttentionAdapter):
-    """Action adapter that uses standard Janus layer weights.
+class ActionStandardAttentionAdapter(nn.Module):
+    """Action adapter backed by standard Qwen3-VL layer weights.
 
-    The action pretrain checkpoint stores normal Llama layer names, not the
-    old three-expert `_action` suffixed names.  This adapter deliberately uses
-    input_layernorm/post_attention_layernorm/self_attn/mlp directly.
+    Qwen3-VL-2B uses grouped-query attention: q/o are hidden-size wide, while
+    k/v are num_kv_heads * head_dim.  The old LatentNativeAttentionAdapter
+    assumed full-width k/v, so this adapter repeats k/v to Cosmos head count.
     """
 
     def __init__(self, janus_layer, cosmos_num_heads, cosmos_head_dim, layer_idx: int):
-        super().__init__(
-            janus_layer=janus_layer,
-            cosmos_num_heads=cosmos_num_heads,
-            cosmos_head_dim=cosmos_head_dim,
-            layer_idx=layer_idx,
-        )
+        super().__init__()
+        self.layer_idx = int(layer_idx)
         self.branch_name = "action"
+        self.norm_qkv = janus_layer.input_layernorm
+        self.norm_ffn = janus_layer.post_attention_layernorm
+        self.mlp = janus_layer.mlp
+        self.branch_attn = janus_layer.self_attn
+        self.num_heads = int(getattr(self.branch_attn, "num_heads", getattr(self.branch_attn, "n_heads", 0)))
+        self.num_kv_heads = int(
+            getattr(
+                self.branch_attn,
+                "num_kv_heads",
+                getattr(self.branch_attn, "num_key_value_heads", self.num_heads),
+            )
+        )
+        self.num_key_value_groups = int(
+            getattr(
+                self.branch_attn,
+                "num_key_value_groups",
+                max(1, self.num_heads // max(1, self.num_kv_heads)),
+            )
+        )
+        self.head_dim = int(getattr(self.branch_attn, "head_dim"))
+        expected_dim = int(cosmos_num_heads) * int(cosmos_head_dim)
+        if self.num_heads != int(cosmos_num_heads) or self.head_dim != int(cosmos_head_dim):
+            raise ValueError(
+                f"Qwen action attention layout must match Cosmos q/o heads: "
+                f"qwen_heads={self.num_heads}, qwen_head_dim={self.head_dim}, "
+                f"cosmos_heads={cosmos_num_heads}, cosmos_head_dim={cosmos_head_dim}."
+            )
+        if int(self.branch_attn.q_proj.out_features) != expected_dim:
+            raise ValueError("Qwen action q projection does not match Cosmos hidden size.")
+        expected_kv_dim = self.num_kv_heads * self.head_dim
+        if int(self.branch_attn.k_proj.out_features) != expected_kv_dim:
+            raise ValueError("Qwen action k projection does not match its GQA layout.")
+        if int(self.branch_attn.v_proj.out_features) != expected_kv_dim:
+            raise ValueError("Qwen action v projection does not match its GQA layout.")
+
+    @staticmethod
+    def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        if n_rep == 1:
+            return hidden_states
+        batch, num_kv_heads, slen, head_dim = hidden_states.shape
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch,
+            num_kv_heads,
+            n_rep,
+            slen,
+            head_dim,
+        )
+        return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+
+    def get_branch_qkv(self, hidden_states: torch.Tensor):
+        norm_x = self.norm_qkv(hidden_states)
+        B, L, _ = norm_x.shape
+        q = self.branch_attn.q_proj(norm_x).view(B, L, self.num_heads, self.head_dim)
+        k = self.branch_attn.k_proj(norm_x).view(B, L, self.num_kv_heads, self.head_dim)
+        v = self.branch_attn.v_proj(norm_x).view(B, L, self.num_kv_heads, self.head_dim)
+        q_norm = getattr(self.branch_attn, "q_norm", None)
+        k_norm = getattr(self.branch_attn, "k_norm", None)
+        if q_norm is not None:
+            q = q_norm(q)
+        if k_norm is not None:
+            k = k_norm(k)
+        k = self._repeat_kv(k.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+        v = self._repeat_kv(v.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
+        return q, k, v
+
+    def post_attention(
+        self,
+        hidden_states: torch.Tensor,
+        attn_out: torch.Tensor,
+        token_valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if attn_out.dim() == 4:
+            attn_out = attn_out.flatten(2, 3)
+        hidden_states = hidden_states + self.branch_attn.o_proj(attn_out)
+        hidden_states = hidden_states + self.mlp(self.norm_ffn(hidden_states))
+        if token_valid_mask is not None:
+            hidden_states = hidden_states * token_valid_mask.unsqueeze(-1).to(hidden_states.dtype)
+        return hidden_states
 
 
 class TrexActionAttentionAdapter(nn.Module):
@@ -341,13 +416,13 @@ class MoTAttentionWrapper2(nn.Module):
         q_a, k_a, v_a = self.action_bridge.get_branch_qkv(self.current_x_action)
         q_a, k_a = self._apply_action_rotary(q_a, k_a, self.current_rotary_payload)
 
-        if self.detach_action_cosmos_kv:
+        if self.detach_action_cosmos_kv and not self.detach_video_kv:
             res_v = self.original_attn.attn_op(q_v, k_v, v_v)
             k = torch.cat([k_v.detach(), k_a], dim=1)
             v = torch.cat([v_v.detach(), v_a], dim=1)
             S_v = q_v.shape[1]
             S_a = q_a.shape[1]
-            mask = self._build_action_only_mask(
+            action_mask = self._build_action_only_mask(
                 S_v,
                 S_a,
                 q_a.device,
@@ -357,7 +432,7 @@ class MoTAttentionWrapper2(nn.Module):
             query_valid_mask = self.current_action_valid_mask
             if query_valid_mask is None:
                 query_valid_mask = torch.ones((q_a.shape[0], S_a), device=q_a.device, dtype=torch.bool)
-            res_a = self._bridge_sdpa(q_a, k, v, attn_mask=mask, query_valid_mask=query_valid_mask)
+            res_a = self._bridge_sdpa(q_a, k, v, attn_mask=action_mask, query_valid_mask=query_valid_mask)
             self.next_x_action = self.action_bridge.post_attention(
                 self.current_x_action,
                 res_a,
@@ -526,6 +601,58 @@ class MoTAttentionWrapper2(nn.Module):
         return self.action_bridge.post_attention(x_action_suffix, result, token_valid_mask=suffix_valid_mask)
 
 
+class ActionStandaloneWrapper(nn.Module):
+    """Right-branch layer that runs without a paired Cosmos layer."""
+
+    def __init__(self, action_bridge):
+        super().__init__()
+        self.action_bridge = action_bridge
+
+    @staticmethod
+    def _build_action_self_mask(S_a: int, device: torch.device, action_tail_token_count: int = 0) -> torch.Tensor:
+        return MoTAttentionWrapper2._build_action_self_mask(
+            S_a,
+            device,
+            action_tail_token_count=action_tail_token_count,
+        ).unsqueeze(0).unsqueeze(0)
+
+    @staticmethod
+    def _standalone_sdpa(q, k, v, attn_mask, query_valid_mask=None):
+        return MoTAttentionWrapper2._bridge_sdpa(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            query_valid_mask=query_valid_mask,
+        )
+
+    def forward_action(
+        self,
+        x_action: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor] = None,
+        rotary_payload: Optional[BridgeRotaryPayload] = None,
+        action_tail_token_count: int = 0,
+    ) -> torch.Tensor:
+        q_a, k_a, v_a = self.action_bridge.get_branch_qkv(x_action)
+        q_a, k_a = MoTAttentionWrapper2._apply_action_rotary(q_a, k_a, rotary_payload)
+        S_a = q_a.shape[1]
+        mask = self._build_action_self_mask(
+            S_a,
+            q_a.device,
+            action_tail_token_count=action_tail_token_count,
+        )
+        if action_valid_mask is not None:
+            valid = action_valid_mask.to(device=q_a.device, dtype=torch.bool)
+            batch_mask = mask.expand(valid.shape[0], -1, -1, -1).clone()
+            batch_mask[:, :, :, :] &= valid[:, None, None, :]
+            mask = batch_mask
+        query_valid_mask = action_valid_mask
+        if query_valid_mask is None:
+            query_valid_mask = torch.ones((q_a.shape[0], S_a), device=q_a.device, dtype=torch.bool)
+        result = self._standalone_sdpa(q_a, k_a, v_a, attn_mask=mask, query_valid_mask=query_valid_mask)
+        return self.action_bridge.post_attention(x_action, result, token_valid_mask=action_valid_mask)
+
+
 class CosmosJanusActionSpatialMoT2Expert(nn.Module):
     """Cosmos video branch + Janus action branch with in-branch spatial tokens."""
 
@@ -535,10 +662,13 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         self.dtype = torch.bfloat16
         self._video_frozen = False
         self.train_embed_tokens = True
-        self.detach_action_cosmos_kv = bool(getattr(config, "detach_action_cosmos_kv", 0))
-        setattr(self.config, "detach_action_cosmos_kv", int(self.detach_action_cosmos_kv))
-        self.action_insert_layer = int(getattr(config, "action_insert_layer", 0) or 0)
-        setattr(self.config, "action_insert_layer", self.action_insert_layer)
+        self.right_single_attn_position = str(getattr(config, "right_single_attn_position", "first4") or "first4").lower()
+        if self.right_single_attn_position not in ("first4", "last4"):
+            raise ValueError(
+                "right_single_attn_position must be 'first4' or 'last4', "
+                f"got {self.right_single_attn_position!r}."
+            )
+        setattr(self.config, "right_single_attn_position", self.right_single_attn_position)
         self.valid_token_vocab_size = int(getattr(config, "valid_token_vocab_size", 0) or 0) or None
         self.bridge_pos_scheme = normalize_bridge_pos_scheme(getattr(config, "bridge_pos_scheme", "llama1d"))
         setattr(self.config, "bridge_pos_scheme", self.bridge_pos_scheme)
@@ -586,6 +716,8 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         self.cosmos_vae = cosmos_vae
         self.janus = janus_model
         self.use_trex_action_backend = bool(getattr(janus_model, "is_trex_action_model", False))
+        self.detach_action_cosmos_kv = bool(getattr(config, "detach_action_cosmos_kv", 1))
+        setattr(self.config, "detach_action_cosmos_kv", int(self.detach_action_cosmos_kv))
         self.janus_dim = self.janus.config.hidden_size
         self.janus_rotary_emb = getattr(self.janus.language_model.model, "rotary_emb", None)
         if self.bridge_pos_scheme == "llama1d" and self.janus_rotary_emb is None:
@@ -595,8 +727,8 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         if not self.special_token_vocab:
             raise ValueError("config.special_token_vocab must be provided for independent spatial token training.")
         setattr(self.config, "special_token_vocab", list(self.special_token_vocab))
+        setattr(self.config, "special_token_weight_tied", True)
         self.special_token_embedding = nn.Embedding(len(self.special_token_vocab), self.janus_dim).to(self.dtype)
-        self.special_token_lm_head = nn.Linear(self.janus_dim, len(self.special_token_vocab), bias=False).to(self.dtype)
         self._init_special_token_modules(getattr(config, "special_token_init_ids", None))
 
         self.num_cond_input_frames = max(1, int(getattr(config, "num_cond_input_frames", 1) or 1))
@@ -647,13 +779,61 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         else:
             self.text_proj = nn.Identity()
 
+        self.prefix_layer_count = 28
+        self.action_layer_count = 4
+        self.right_layer_count = self.prefix_layer_count + self.action_layer_count
+        cosmos_blocks = list(self.cosmos_dit.blocks)
+        qwen_layers = list(self.janus.language_model.model.layers)
+        fast_layers = list(getattr(self.janus, "fast_action_layers", []))
+        if len(qwen_layers) < self.prefix_layer_count:
+            raise ValueError(f"Need at least {self.prefix_layer_count} Qwen prefix layers, got {len(qwen_layers)}.")
+        if len(fast_layers) < self.action_layer_count:
+            raise ValueError(f"Need {self.action_layer_count} T-Rex fast action layers, got {len(fast_layers)}.")
+        if len(cosmos_blocks) != self.prefix_layer_count:
+            raise ValueError(f"Expected {self.prefix_layer_count} Cosmos blocks, got {len(cosmos_blocks)}.")
+
         self.mot_attention_wrappers = nn.ModuleList()
+        self.right_layers = nn.ModuleList([nn.Identity() for _ in range(self.right_layer_count)])
+        self.right_layer_specs = []
         self.bridge_rotary_encoder = None
-        janus_layers = self.janus.language_model.model.layers
-        for i, cosmos_block in enumerate(self.cosmos_dit.blocks):
-            if i >= len(janus_layers):
-                break
-            janus_layer = janus_layers[i]
+
+        def right_to_cosmos_idx(right_idx: int):
+            if self.right_single_attn_position == "first4":
+                return None if right_idx < self.action_layer_count else right_idx - self.action_layer_count
+            return right_idx if right_idx < self.prefix_layer_count else None
+
+        first_block = cosmos_blocks[0]
+        first_actual = getattr(first_block, "_checkpoint_wrapped_module", getattr(first_block, "module", first_block))
+        default_head_dim = int(first_actual.self_attn.head_dim)
+        default_heads = int(first_actual.self_attn.n_heads)
+
+        for right_idx in range(self.right_layer_count):
+            cosmos_idx = right_to_cosmos_idx(right_idx)
+            if right_idx < self.prefix_layer_count:
+                source_layer = qwen_layers[right_idx]
+                make_bridge = lambda layer=source_layer, idx=right_idx, heads=default_heads, head_dim=default_head_dim: ActionStandardAttentionAdapter(
+                    janus_layer=layer,
+                    cosmos_num_heads=heads,
+                    cosmos_head_dim=head_dim,
+                    layer_idx=idx,
+                ).to(self.dtype)
+            else:
+                source_layer = fast_layers[right_idx - self.prefix_layer_count]
+                make_bridge = lambda layer=source_layer, idx=right_idx, heads=default_heads, head_dim=default_head_dim: TrexActionAttentionAdapter(
+                    trex_layer=layer,
+                    cosmos_num_heads=heads,
+                    cosmos_head_dim=head_dim,
+                    layer_idx=idx,
+                ).to(self.dtype)
+
+            if cosmos_idx is None:
+                action_bridge = make_bridge()
+                standalone = ActionStandaloneWrapper(action_bridge).to(self.dtype)
+                self.right_layers[right_idx] = standalone
+                self.right_layer_specs.append({"kind": "standalone", "right_idx": right_idx, "cosmos_idx": None})
+                continue
+
+            cosmos_block = cosmos_blocks[cosmos_idx]
             actual_block = cosmos_block
             if hasattr(cosmos_block, "_checkpoint_wrapped_module"):
                 actual_block = cosmos_block._checkpoint_wrapped_module
@@ -667,6 +847,13 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                         head_dim=block_head_dim,
                         interleave_thw=self.bridge_pos_scheme == "mrope_interleave",
                     )
+                elif self.bridge_pos_scheme == "qwen":
+                    if self.janus_rotary_emb is None:
+                        raise ValueError("bridge_pos_scheme='qwen' requires the Qwen rotary embedding module.")
+                    self.bridge_rotary_encoder = BridgeQwenNativeMRoPE(
+                        head_dim=block_head_dim,
+                        janus_rotary_emb=self.janus_rotary_emb,
+                    )
                 else:
                     self.bridge_rotary_encoder = BridgeLlama1DRoPE(
                         head_dim=block_head_dim,
@@ -678,19 +865,19 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                     f"got {block_head_dim} after {self.bridge_rotary_encoder.head_dim}."
                 )
 
-            if self.use_trex_action_backend:
-                action_bridge = TrexActionAttentionAdapter(
-                    trex_layer=janus_layer,
+            if right_idx < self.prefix_layer_count:
+                action_bridge = ActionStandardAttentionAdapter(
+                    janus_layer=source_layer,
                     cosmos_num_heads=actual_block.self_attn.n_heads,
                     cosmos_head_dim=block_head_dim,
-                    layer_idx=i,
+                    layer_idx=right_idx,
                 ).to(self.dtype)
             else:
-                action_bridge = ActionStandardAttentionAdapter(
-                    janus_layer=janus_layer,
+                action_bridge = TrexActionAttentionAdapter(
+                    trex_layer=source_layer,
                     cosmos_num_heads=actual_block.self_attn.n_heads,
                     cosmos_head_dim=block_head_dim,
-                    layer_idx=i,
+                    layer_idx=right_idx,
                 ).to(self.dtype)
             mot_attn = MoTAttentionWrapper2(
                 actual_block.self_attn,
@@ -730,18 +917,16 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
 
             actual_block.forward = types.MethodType(make_new_forward(original_forward), actual_block)
             self.mot_attention_wrappers.append(mot_attn)
+            self.right_layers[right_idx] = mot_attn
+            self.right_layer_specs.append({"kind": "paired", "right_idx": right_idx, "cosmos_idx": cosmos_idx, "block": cosmos_block})
 
         if self.bridge_rotary_encoder is None:
             raise ValueError("Failed to initialize MoT wrappers.")
-        if self.action_insert_layer < 0 or self.action_insert_layer > 27:
-            raise ValueError(
-                f"action_insert_layer must be in [0, 27], got {self.action_insert_layer}."
-            )
-        if self.action_insert_layer >= len(self.mot_attention_wrappers) and self.action_insert_layer != 0:
-            raise ValueError(
-                "action_insert_layer must be smaller than the number of MoT layers: "
-                f"insert={self.action_insert_layer}, layers={len(self.mot_attention_wrappers)}."
-            )
+        if len(self.right_layer_specs) != self.right_layer_count:
+            raise ValueError(f"Expected {self.right_layer_count} right layer specs, got {len(self.right_layer_specs)}.")
+        setattr(self.config, "right_layer_count", self.right_layer_count)
+        setattr(self.config, "prefix_layer_count", self.prefix_layer_count)
+        setattr(self.config, "action_layer_count", self.action_layer_count)
 
     def _sample_cosmos_train_sigma(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         shift = 5.0
@@ -774,8 +959,6 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 f"{len(source_ids_by_token)} != {len(self.special_token_vocab)}."
             )
         base_embed = self.janus.language_model.model.embed_tokens.weight
-        base_lm_head = getattr(self.janus.language_model, "lm_head", None)
-        base_lm_head_weight = None if base_lm_head is None else getattr(base_lm_head, "weight", None)
         with torch.no_grad():
             for row_idx, (token_text, source_ids) in enumerate(zip(self.special_token_vocab, source_ids_by_token)):
                 ids = [int(token_id) for token_id in source_ids]
@@ -792,23 +975,6 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                     embed_init.to(
                         device=self.special_token_embedding.weight.device,
                         dtype=self.special_token_embedding.weight.dtype,
-                    )
-                )
-
-                if base_lm_head_weight is not None:
-                    if max(ids) >= int(base_lm_head_weight.shape[0]):
-                        raise ValueError(
-                            f"Source ids for {token_text!r} exceed base lm_head rows: "
-                            f"ids={ids}, rows={int(base_lm_head_weight.shape[0])}."
-                        )
-                    head_ids = torch.tensor(ids, device=base_lm_head_weight.device, dtype=torch.long)
-                    head_init = base_lm_head_weight.index_select(0, head_ids).mean(dim=0)
-                else:
-                    head_init = embed_init
-                self.special_token_lm_head.weight[row_idx].copy_(
-                    head_init.to(
-                        device=self.special_token_lm_head.weight.device,
-                        dtype=self.special_token_lm_head.weight.dtype,
                     )
                 )
 
@@ -891,6 +1057,9 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             wrapper.cached_k_a_prefix = None
             wrapper.cached_v_a_prefix = None
             wrapper.cached_action_prefix_valid_mask = None
+        self._cached_prefix_hidden = None
+        self._cached_action_prefix_valid_mask = None
+        self._cached_qwen_context_position_ids = None
 
     def _detach_cached_video_kv(self):
         for wrapper in self.mot_attention_wrappers:
@@ -900,12 +1069,18 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 wrapper.cached_v_v = wrapper.cached_v_v.detach()
 
     def _get_cached_action_prefix_valid_mask(self) -> torch.Tensor:
+        cached = getattr(self, "_cached_action_prefix_valid_mask", None)
+        if cached is not None:
+            return cached
         for wrapper in self.mot_attention_wrappers:
             if wrapper.cached_action_prefix_valid_mask is not None:
                 return wrapper.cached_action_prefix_valid_mask
         raise RuntimeError("No cached action prefix KV is available.")
 
     def _get_cached_action_prefix_len(self) -> int:
+        cached = getattr(self, "_cached_prefix_hidden", None)
+        if cached is not None:
+            return int(cached.shape[1])
         for wrapper in self.mot_attention_wrappers:
             if wrapper.cached_k_a_prefix is not None:
                 return int(wrapper.cached_k_a_prefix.shape[1])
@@ -983,7 +1158,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         return self.special_token_embedding(input_ids)
 
     def _special_token_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.special_token_lm_head(hidden_states)
+        return F.linear(hidden_states, self.special_token_embedding.weight)
 
     def _action_final_norm(self):
         model = self.janus.language_model.model
@@ -1118,6 +1293,59 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         elif state_seq_mask is not None and bool(state_seq_mask.any().item()):
             raise ValueError("janus_state_seq_mask contains placeholders but now_state is None.")
         return context_embeds
+
+    def _build_qwen_context_position_ids(
+        self,
+        janus_input_ids: torch.Tensor,
+        janus_image_grid_thw: Optional[torch.Tensor],
+        janus_attention_mask: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if self.bridge_pos_scheme != "qwen":
+            return None
+        position_ids, _ = self.janus.get_rope_index(
+            input_ids=janus_input_ids,
+            image_grid_thw=janus_image_grid_thw,
+            attention_mask=janus_attention_mask,
+        )
+        position_ids = position_ids.to(device=janus_input_ids.device, dtype=torch.long)
+        batch_size, context_len = janus_input_ids.shape
+        if position_ids.ndim == 3 and position_ids.shape == (batch_size, 3, context_len):
+            position_ids = position_ids.permute(1, 0, 2).contiguous()
+        if position_ids.ndim == 3 and position_ids.shape != (3, batch_size, context_len):
+            raise ValueError(
+                "Qwen get_rope_index must return [3,B,L] or [B,3,L], "
+                f"got {tuple(position_ids.shape)}."
+            )
+        if position_ids.ndim == 2 and position_ids.shape != (batch_size, context_len):
+            raise ValueError(
+                f"Qwen 1-D fallback position_ids must be {(batch_size, context_len)}, "
+                f"got {tuple(position_ids.shape)}."
+            )
+        if position_ids.ndim not in (2, 3):
+            raise ValueError(f"Unsupported Qwen position_ids shape {tuple(position_ids.shape)}.")
+        return position_ids
+
+    def _extend_qwen_position_ids(
+        self,
+        context_position_ids: Optional[torch.Tensor],
+        total_seq_len: int,
+    ) -> Optional[torch.Tensor]:
+        if self.bridge_pos_scheme != "qwen":
+            return None
+        if context_position_ids is None:
+            raise ValueError("bridge_pos_scheme='qwen' requires context position_ids.")
+        context_len = int(context_position_ids.shape[-1])
+        total_seq_len = int(total_seq_len)
+        if total_seq_len < context_len:
+            raise ValueError(
+                f"Cannot shrink Qwen position_ids from context_len={context_len} to total_seq_len={total_seq_len}."
+            )
+        if total_seq_len == context_len:
+            return context_position_ids
+        return self.janus.extend_position_ids(
+            context_position_ids,
+            extra_token_count=total_seq_len - context_len,
+        )
 
     def _build_spatial_hidden_siglip_targets(
         self,
@@ -1309,6 +1537,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         janus_images_emb_mask: Optional[torch.Tensor] = None,
         janus_image_grid_thw: Optional[torch.Tensor] = None,
         video_grid_thw: Optional[torch.Tensor] = None,
+        qwen_position_ids: Optional[torch.Tensor] = None,
     ) -> BridgeMRoPEBatchInfo:
         batch_size = x_action.shape[0]
         device = x_action.device
@@ -1339,6 +1568,9 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             video_grid_thw=None
             if video_grid_thw is None or not use_mrope
             else video_grid_thw.to(device=device, dtype=torch.long),
+            qwen_position_ids=None
+            if qwen_position_ids is None
+            else qwen_position_ids.to(device=device, dtype=torch.long),
         )
 
     def _build_bridge_rotary_payload(
@@ -1396,6 +1628,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         janus_images_seq_mask: Optional[torch.Tensor] = None,
         janus_images_emb_mask: Optional[torch.Tensor] = None,
         janus_image_grid_thw: Optional[torch.Tensor] = None,
+        qwen_context_position_ids: Optional[torch.Tensor] = None,
     ) -> BridgeRotaryPayload:
         dummy_action = torch.empty(
             (batch_size, int(total_action_len), self.janus_dim),
@@ -1405,6 +1638,10 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         cached_video_grid_thw = None
         if is_multimodal_bridge_pos_scheme(self.bridge_pos_scheme):
             cached_video_grid_thw = self._get_cached_bridge_video_grid_thw(batch_size, device)
+        qwen_position_ids = self._extend_qwen_position_ids(
+            qwen_context_position_ids,
+            total_seq_len=int(total_action_len),
+        )
         rotary_info = self._build_action_rotary_batch_info(
             x_action=dummy_action,
             action_valid_mask=action_valid_mask,
@@ -1413,6 +1650,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             janus_images_emb_mask=janus_images_emb_mask,
             janus_image_grid_thw=janus_image_grid_thw,
             video_grid_thw=cached_video_grid_thw,
+            qwen_position_ids=qwen_position_ids,
         )
         return self._build_bridge_rotary_payload(
             rotary_info,
@@ -1432,46 +1670,59 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 return cached
         raise ValueError("No cached video grid THW is available.")
 
-    def joint_denoise_step_with_action_insert(
+    def _run_standalone_right_layer(
         self,
-        video_latent: torch.Tensor,
-        action_latent: torch.Tensor,
-        spatial_token_embeds: torch.Tensor,
-        context_embeds: torch.Tensor,
-        timestep_vid: torch.Tensor,
-        timestep_act: torch.Tensor,
-        fps: Optional[torch.Tensor] = None,
-        janus_left_pad_lens: Optional[torch.Tensor] = None,
-        janus_attention_mask: Optional[torch.Tensor] = None,
-        janus_images_seq_mask: Optional[torch.Tensor] = None,
-        janus_images_emb_mask: Optional[torch.Tensor] = None,
-        janus_image_grid_thw: Optional[torch.Tensor] = None,
-        cosmos_text_embeddings: Optional[torch.Tensor] = None,
-        cosmos_context_embeds: Optional[torch.Tensor] = None,
-    ):
-        insert_layer = int(self.action_insert_layer)
-        if insert_layer <= 0:
-            raise ValueError("joint_denoise_step_with_action_insert requires action_insert_layer > 0.")
+        layer: ActionStandaloneWrapper,
+        x_action: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor],
+        rotary_payload: Optional[BridgeRotaryPayload],
+        action_tail_token_count: int = 0,
+    ) -> torch.Tensor:
+        return layer.forward_action(
+            x_action,
+            action_valid_mask=action_valid_mask,
+            rotary_payload=rotary_payload,
+            action_tail_token_count=action_tail_token_count,
+        )
 
-        video_latent = video_latent.to(self.dtype)
-        action_latent = action_latent.to(self.dtype)
-        spatial_token_embeds = spatial_token_embeds.to(self.dtype)
-        context_embeds = context_embeds.to(self.dtype)
+    def _run_paired_right_layer(
+        self,
+        block,
+        x_video: torch.Tensor,
+        x_action: torch.Tensor,
+        t_emb: torch.Tensor,
+        crossattn_emb: torch.Tensor,
+        rope_emb,
+        adaln_lora,
+        extra_pos,
+        action_valid_mask: Optional[torch.Tensor],
+        rotary_payload: Optional[BridgeRotaryPayload],
+        action_tail_token_count: int = 0,
+        cache_video_kv: bool = False,
+        cache_video_kv_detach: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return block(
+            x_B_T_H_W_D=x_video,
+            emb_B_T_D=t_emb,
+            crossattn_emb=crossattn_emb,
+            x_action=x_action,
+            x_action_valid_mask=action_valid_mask,
+            x_rotary_payload=rotary_payload,
+            mot_cache_video_kv=cache_video_kv,
+            mot_cache_video_kv_detach=cache_video_kv_detach,
+            mot_action_tail_token_count=action_tail_token_count,
+            rope_emb_L_1_1_D=rope_emb,
+            adaln_lora_B_T_3D=adaln_lora,
+            extra_per_block_pos_emb=extra_pos,
+        )
 
+    def _build_video_dit_inputs(self, video_latent, timestep_vid, fps):
         B = video_latent.shape[0]
         device = video_latent.device
         if fps is None:
             fps = torch.full((B,), 10.0, device=device, dtype=self.dtype)
         elif not isinstance(fps, torch.Tensor):
             fps = torch.full((B,), float(fps), device=device, dtype=self.dtype)
-
-        x_prefix, prefix_valid_mask = self._build_action_sequence(
-            context_embeds=context_embeds,
-            spatial_token_embeds=spatial_token_embeds,
-            janus_left_pad_lens=janus_left_pad_lens,
-            janus_attention_mask=janus_attention_mask,
-        )
-
         scale = getattr(self.cosmos_dit, "timestep_scale", 1.0)
         cosmos_t_scaled = timestep_vid * 1000.0 * scale
         cosmos_t_unsqueeze = cosmos_t_scaled.unsqueeze(1) if cosmos_t_scaled.ndim == 1 else cosmos_t_scaled
@@ -1492,139 +1743,39 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             fps=fps,
             padding_mask=padding_mask,
         )
+        return x_video, t_emb, adaln_lora, rope_emb, extra_pos
 
-        video_grid_thw = None
-        if is_multimodal_bridge_pos_scheme(self.bridge_pos_scheme):
-            video_grid_thw = torch.tensor(
-                [int(x_video.shape[1]), int(x_video.shape[2]), int(x_video.shape[3])],
-                device=device,
-                dtype=torch.long,
-            ).unsqueeze(0).expand(B, -1)
-        prefix_rotary_info = self._build_action_rotary_batch_info(
-            x_action=x_prefix,
-            action_valid_mask=prefix_valid_mask,
+    def _build_rotary_payload_for_action(
+        self,
+        x_action: torch.Tensor,
+        action_valid_mask: Optional[torch.Tensor],
+        janus_left_pad_lens: Optional[torch.Tensor],
+        janus_images_seq_mask: Optional[torch.Tensor],
+        janus_images_emb_mask: Optional[torch.Tensor],
+        janus_image_grid_thw: Optional[torch.Tensor],
+        video_grid_thw: Optional[torch.Tensor],
+        qwen_context_position_ids: Optional[torch.Tensor] = None,
+    ) -> BridgeRotaryPayload:
+        qwen_position_ids = self._extend_qwen_position_ids(
+            qwen_context_position_ids,
+            total_seq_len=x_action.shape[1],
+        )
+        rotary_batch_info = self._build_action_rotary_batch_info(
+            x_action=x_action,
+            action_valid_mask=action_valid_mask,
             janus_left_pad_lens=janus_left_pad_lens,
             janus_images_seq_mask=janus_images_seq_mask,
             janus_images_emb_mask=janus_images_emb_mask,
             janus_image_grid_thw=janus_image_grid_thw,
             video_grid_thw=video_grid_thw,
+            qwen_position_ids=qwen_position_ids,
         )
-        prefix_rotary_payload = self._build_bridge_rotary_payload(
-            prefix_rotary_info,
-            action_seq_len=x_prefix.shape[1],
-            device=device,
-            dtype=x_prefix.dtype,
+        return self._build_bridge_rotary_payload(
+            rotary_batch_info,
+            action_seq_len=x_action.shape[1],
+            device=x_action.device,
+            dtype=x_action.dtype,
         )
-        crossattn_source_embeds = context_embeds if cosmos_context_embeds is None else cosmos_context_embeds.to(self.dtype)
-        crossattn_emb = self._prepare_cosmos_crossattn_emb(
-            crossattn_source_embeds,
-            cosmos_text_embeddings=cosmos_text_embeddings,
-        )
-
-        for i, block in enumerate(self.cosmos_dit.blocks):
-            if i < len(self.mot_attention_wrappers):
-                x_video, _ = block(
-                    x_B_T_H_W_D=x_video,
-                    emb_B_T_D=t_emb,
-                    crossattn_emb=crossattn_emb,
-                    x_action=None,
-                    mot_cache_video_kv=True,
-                    mot_cache_video_kv_detach=False,
-                    rope_emb_L_1_1_D=rope_emb,
-                    adaln_lora_B_T_3D=adaln_lora,
-                    extra_per_block_pos_emb=extra_pos,
-                )
-            else:
-                if self._video_frozen:
-                    with torch.no_grad():
-                        x_video = block(
-                            x_B_T_H_W_D=x_video,
-                            emb_B_T_D=t_emb,
-                            crossattn_emb=crossattn_emb,
-                            rope_emb_L_1_1_D=rope_emb,
-                            adaln_lora_B_T_3D=adaln_lora,
-                            extra_per_block_pos_emb=extra_pos,
-                        )
-                else:
-                    x_video = block(
-                        x_B_T_H_W_D=x_video,
-                        emb_B_T_D=t_emb,
-                        crossattn_emb=crossattn_emb,
-                        rope_emb_L_1_1_D=rope_emb,
-                        adaln_lora_B_T_3D=adaln_lora,
-                        extra_per_block_pos_emb=extra_pos,
-                    )
-
-        if self._video_frozen:
-            with torch.no_grad():
-                x_video_patch = self.cosmos_dit.final_layer(x_video, t_emb, adaln_lora_B_T_3D=adaln_lora)
-                video_v = self.cosmos_dit.unpatchify(x_video_patch)
-        else:
-            x_video_patch = self.cosmos_dit.final_layer(x_video, t_emb, adaln_lora_B_T_3D=adaln_lora)
-            video_v = self.cosmos_dit.unpatchify(x_video_patch)
-
-        prefix_hidden = x_prefix
-        for wrapper in self.mot_attention_wrappers:
-            prefix_hidden = wrapper.forward_action_prefix_and_cache(
-                prefix_hidden,
-                action_valid_mask=prefix_valid_mask,
-                rotary_payload=prefix_rotary_payload,
-                action_tail_token_count=0,
-                append_to_cache=True,
-            )
-        prefix_hidden_norm = self._action_final_norm()(prefix_hidden)
-        spatial_anchor_hiddens = self._gather_spatial_anchor_hiddens(
-            prefix_hidden_norm,
-            prefix_valid_mask,
-            context_len=context_embeds.shape[1],
-            spatial_token_count=spatial_token_embeds.shape[1],
-        )
-
-        # Action loss must not update the prefix/video path before insertion.
-        # Prefix KV is already cached detached by forward_action_prefix_and_cache.
-        self._detach_cached_video_kv()
-
-        time_tokens = self.janus.t_embedder(timestep_act).unsqueeze(1).to(dtype=self.dtype)
-        action_tokens = self.janus.x_embedder(action_latent.to(dtype=self.dtype))
-        suffix = torch.cat([time_tokens, action_tokens], dim=1)
-        suffix_valid_mask = torch.ones((B, suffix.shape[1]), device=device, dtype=torch.bool)
-        prefix_len = self._get_cached_action_prefix_len()
-        full_valid_mask = torch.cat(
-            [
-                self._get_cached_action_prefix_valid_mask().to(device=device, dtype=torch.bool),
-                suffix_valid_mask,
-            ],
-            dim=1,
-        )
-        total_len = prefix_len + suffix.shape[1]
-        full_rotary_payload = self._build_action_rotary_payload_for_length(
-            batch_size=B,
-            total_action_len=total_len,
-            action_valid_mask=full_valid_mask,
-            device=device,
-            dtype=suffix.dtype,
-            janus_left_pad_lens=janus_left_pad_lens,
-            janus_images_seq_mask=janus_images_seq_mask,
-            janus_images_emb_mask=janus_images_emb_mask,
-            janus_image_grid_thw=janus_image_grid_thw,
-        )
-        suffix_rotary_payload = self._slice_bridge_rotary_payload(
-            full_rotary_payload,
-            prefix_len,
-            total_len,
-        )
-        action_hidden = suffix
-        for wrapper in self.mot_attention_wrappers[insert_layer:]:
-            action_hidden = wrapper.forward_action_suffix_only(
-                action_hidden,
-                suffix_valid_mask=suffix_valid_mask,
-                rotary_payload=suffix_rotary_payload,
-                action_tail_token_count=action_latent.shape[1],
-            )
-        action_hidden_norm = self._action_final_norm()(action_hidden)
-        action_out = action_hidden_norm[:, -action_latent.shape[1]:, :]
-        action_v = self.janus.final_layer(action_out)
-        return video_v, action_v, spatial_anchor_hiddens
 
     def joint_denoise_step(
         self,
@@ -1642,69 +1793,24 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         janus_image_grid_thw: Optional[torch.Tensor] = None,
         cosmos_text_embeddings: Optional[torch.Tensor] = None,
         cosmos_context_embeds: Optional[torch.Tensor] = None,
+        qwen_context_position_ids: Optional[torch.Tensor] = None,
         cache_video_kv: bool = False,
         cache_video_kv_detach: bool = True,
     ):
-        if int(self.action_insert_layer) > 0:
-            return self.joint_denoise_step_with_action_insert(
-                video_latent=video_latent,
-                action_latent=action_latent,
-                spatial_token_embeds=spatial_token_embeds,
-                context_embeds=context_embeds,
-                timestep_vid=timestep_vid,
-                timestep_act=timestep_act,
-                fps=fps,
-                janus_left_pad_lens=janus_left_pad_lens,
-                janus_attention_mask=janus_attention_mask,
-                janus_images_seq_mask=janus_images_seq_mask,
-                janus_images_emb_mask=janus_images_emb_mask,
-                janus_image_grid_thw=janus_image_grid_thw,
-                cosmos_text_embeddings=cosmos_text_embeddings,
-                cosmos_context_embeds=cosmos_context_embeds,
-            )
-
         video_latent = video_latent.to(self.dtype)
         action_latent = action_latent.to(self.dtype)
         spatial_token_embeds = spatial_token_embeds.to(self.dtype)
         context_embeds = context_embeds.to(self.dtype)
-
         B = video_latent.shape[0]
         device = video_latent.device
-        if fps is None:
-            fps = torch.full((B,), 10.0, device=device, dtype=self.dtype)
-        elif not isinstance(fps, torch.Tensor):
-            fps = torch.full((B,), float(fps), device=device, dtype=self.dtype)
 
-        x_action, action_valid_mask = self._build_action_sequence(
+        x_prefix, prefix_valid_mask = self._build_action_sequence(
             context_embeds=context_embeds,
             spatial_token_embeds=spatial_token_embeds,
-            action_latent=action_latent,
-            timestep_act=timestep_act,
             janus_left_pad_lens=janus_left_pad_lens,
             janus_attention_mask=janus_attention_mask,
         )
-
-        scale = getattr(self.cosmos_dit, "timestep_scale", 1.0)
-        cosmos_t_scaled = timestep_vid * 1000.0 * scale
-        cosmos_t_unsqueeze = cosmos_t_scaled.unsqueeze(1) if cosmos_t_scaled.ndim == 1 else cosmos_t_scaled
-        use_wan_fp32 = getattr(self.cosmos_dit, "use_wan_fp32_strategy", False)
-        cosmos_t_unsqueeze = cosmos_t_unsqueeze.to(torch.float32 if use_wan_fp32 else self.dtype)
-        with torch.amp.autocast("cuda", enabled=use_wan_fp32, dtype=torch.float32):
-            t_emb, adaln_lora = self.cosmos_dit.t_embedder(cosmos_t_unsqueeze)
-            t_emb = self.cosmos_dit.t_embedding_norm(t_emb)
-
-        _, _, T_vid, H_vid, W_vid = video_latent.shape
-        n_cond = self._num_real_condition_latents(T_vid)
-        condition_mask = torch.zeros((B, 1, T_vid, H_vid, W_vid), device=device, dtype=video_latent.dtype)
-        condition_mask[:, :, :n_cond] = 1.0
-        video_latent_with_mask = torch.cat([video_latent, condition_mask], dim=1)
-        padding_mask = torch.zeros((B, 1, H_vid, W_vid), device=device, dtype=video_latent.dtype)
-        x_video, rope_emb, extra_pos = self.cosmos_dit.prepare_embedded_sequence(
-            video_latent_with_mask,
-            fps=fps,
-            padding_mask=padding_mask,
-        )
-
+        x_video, t_emb, adaln_lora, rope_emb, extra_pos = self._build_video_dit_inputs(video_latent, timestep_vid, fps)
         video_grid_thw = None
         if is_multimodal_bridge_pos_scheme(self.bridge_pos_scheme):
             video_grid_thw = torch.tensor(
@@ -1712,63 +1818,104 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 device=device,
                 dtype=torch.long,
             ).unsqueeze(0).expand(B, -1)
-        rotary_batch_info = self._build_action_rotary_batch_info(
-            x_action=x_action,
-            action_valid_mask=action_valid_mask,
-            janus_left_pad_lens=janus_left_pad_lens,
-            janus_images_seq_mask=janus_images_seq_mask,
-            janus_images_emb_mask=janus_images_emb_mask,
-            janus_image_grid_thw=janus_image_grid_thw,
-            video_grid_thw=video_grid_thw,
-        )
-        rotary_payload = self._build_bridge_rotary_payload(
-            rotary_batch_info,
-            action_seq_len=x_action.shape[1],
-            device=device,
-            dtype=x_action.dtype,
-        )
         crossattn_source_embeds = context_embeds if cosmos_context_embeds is None else cosmos_context_embeds.to(self.dtype)
         crossattn_emb = self._prepare_cosmos_crossattn_emb(
             crossattn_source_embeds,
             cosmos_text_embeddings=cosmos_text_embeddings,
         )
 
-        for i, block in enumerate(self.cosmos_dit.blocks):
-            if i < len(self.mot_attention_wrappers):
-                x_video, x_action = block(
-                    x_B_T_H_W_D=x_video,
-                    emb_B_T_D=t_emb,
-                    crossattn_emb=crossattn_emb,
-                    x_action=x_action,
-                    x_action_valid_mask=action_valid_mask,
-                    x_rotary_payload=rotary_payload,
-                    mot_cache_video_kv=cache_video_kv,
-                    mot_cache_video_kv_detach=cache_video_kv_detach,
-                    mot_action_tail_token_count=action_latent.shape[1],
-                    rope_emb_L_1_1_D=rope_emb,
-                    adaln_lora_B_T_3D=adaln_lora,
-                    extra_per_block_pos_emb=extra_pos,
+        prefix_rotary_payload = self._build_rotary_payload_for_action(
+            x_prefix,
+            prefix_valid_mask,
+            janus_left_pad_lens,
+            janus_images_seq_mask,
+            janus_images_emb_mask,
+            janus_image_grid_thw,
+            video_grid_thw,
+            qwen_context_position_ids=qwen_context_position_ids,
+        )
+        prefix_hidden = x_prefix
+        for right_idx in range(self.prefix_layer_count):
+            spec = self.right_layer_specs[right_idx]
+            layer = self.right_layers[right_idx]
+            if spec["kind"] == "standalone":
+                prefix_hidden = self._run_standalone_right_layer(
+                    layer,
+                    prefix_hidden,
+                    prefix_valid_mask,
+                    prefix_rotary_payload,
+                    action_tail_token_count=0,
                 )
             else:
-                if self._video_frozen:
-                    with torch.no_grad():
-                        x_video = block(
-                            x_B_T_H_W_D=x_video,
-                            emb_B_T_D=t_emb,
-                            crossattn_emb=crossattn_emb,
-                            rope_emb_L_1_1_D=rope_emb,
-                            adaln_lora_B_T_3D=adaln_lora,
-                            extra_per_block_pos_emb=extra_pos,
-                        )
-                else:
-                    x_video = block(
-                        x_B_T_H_W_D=x_video,
-                        emb_B_T_D=t_emb,
-                        crossattn_emb=crossattn_emb,
-                        rope_emb_L_1_1_D=rope_emb,
-                        adaln_lora_B_T_3D=adaln_lora,
-                        extra_per_block_pos_emb=extra_pos,
-                    )
+                x_video, prefix_hidden = self._run_paired_right_layer(
+                    spec["block"],
+                    x_video,
+                    prefix_hidden,
+                    t_emb,
+                    crossattn_emb,
+                    rope_emb,
+                    adaln_lora,
+                    extra_pos,
+                    prefix_valid_mask,
+                    prefix_rotary_payload,
+                    action_tail_token_count=0,
+                    cache_video_kv=cache_video_kv,
+                    cache_video_kv_detach=cache_video_kv_detach,
+                )
+
+        prefix_hidden_norm = self._action_final_norm()(prefix_hidden)
+        spatial_anchor_hiddens = self._gather_spatial_anchor_hiddens(
+            prefix_hidden_norm,
+            prefix_valid_mask,
+            context_len=context_embeds.shape[1],
+            spatial_token_count=spatial_token_embeds.shape[1],
+        )
+
+        # Keep action-flow gradients inside the final four T-Rex layers.
+        # Prefix/Qwen parameters are trained by spatial CE and hidden-sim losses.
+        prefix_for_action = prefix_hidden.detach()
+        suffix_valid_mask = torch.ones((B, 1 + action_latent.shape[1]), device=device, dtype=torch.bool)
+        full_valid_mask = torch.cat([prefix_valid_mask, suffix_valid_mask], dim=1)
+        time_tokens = self.janus.t_embedder(timestep_act).unsqueeze(1).to(dtype=self.dtype)
+        action_tokens = self.janus.x_embedder(action_latent.to(dtype=self.dtype))
+        action_hidden = torch.cat([prefix_for_action, time_tokens, action_tokens], dim=1)
+        action_rotary_payload = self._build_rotary_payload_for_action(
+            action_hidden,
+            full_valid_mask,
+            janus_left_pad_lens,
+            janus_images_seq_mask,
+            janus_images_emb_mask,
+            janus_image_grid_thw,
+            video_grid_thw,
+            qwen_context_position_ids=qwen_context_position_ids,
+        )
+        for right_idx in range(self.prefix_layer_count, self.right_layer_count):
+            spec = self.right_layer_specs[right_idx]
+            layer = self.right_layers[right_idx]
+            if spec["kind"] == "standalone":
+                action_hidden = self._run_standalone_right_layer(
+                    layer,
+                    action_hidden,
+                    full_valid_mask,
+                    action_rotary_payload,
+                    action_tail_token_count=action_latent.shape[1],
+                )
+            else:
+                x_video, action_hidden = self._run_paired_right_layer(
+                    spec["block"],
+                    x_video,
+                    action_hidden,
+                    t_emb,
+                    crossattn_emb,
+                    rope_emb,
+                    adaln_lora,
+                    extra_pos,
+                    full_valid_mask,
+                    action_rotary_payload,
+                    action_tail_token_count=action_latent.shape[1],
+                    cache_video_kv=cache_video_kv,
+                    cache_video_kv_detach=cache_video_kv_detach,
+                )
 
         if self._video_frozen:
             with torch.no_grad():
@@ -1778,16 +1925,9 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             x_video_patch = self.cosmos_dit.final_layer(x_video, t_emb, adaln_lora_B_T_3D=adaln_lora)
             video_v = self.cosmos_dit.unpatchify(x_video_patch)
 
-        action_norm = self._action_final_norm()
-        x_action_norm = action_norm(x_action)
-        action_out = x_action_norm[:, -action_latent.shape[1]:, :]
+        action_hidden_norm = self._action_final_norm()(action_hidden)
+        action_out = action_hidden_norm[:, -action_latent.shape[1]:, :]
         action_v = self.janus.final_layer(action_out)
-        spatial_anchor_hiddens = self._gather_spatial_anchor_hiddens(
-            x_action_norm,
-            action_valid_mask,
-            context_len=context_embeds.shape[1],
-            spatial_token_count=spatial_token_embeds.shape[1],
-        )
         return video_v, action_v, spatial_anchor_hiddens
 
     @torch.no_grad()
@@ -1881,6 +2021,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         janus_images_seq_mask: Optional[torch.Tensor] = None,
         janus_images_emb_mask: Optional[torch.Tensor] = None,
         janus_image_grid_thw: Optional[torch.Tensor] = None,
+        qwen_context_position_ids: Optional[torch.Tensor] = None,
         return_spatial_debug: bool = False,
     ):
         num_spatial_tokens = self._resolve_spatial_token_count(num_spatial_tokens)
@@ -1898,7 +2039,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
 
         spatial_parts = []
         last_anchor_hidden = None
-        last_token_ids = None
+        generated_token_ids = []
         for _ in range(num_spatial_tokens):
             prev = (
                 torch.cat(spatial_parts, dim=1)
@@ -1911,6 +2052,10 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 janus_left_pad_lens=janus_left_pad_lens,
                 janus_attention_mask=janus_attention_mask,
             )
+            qwen_position_ids = self._extend_qwen_position_ids(
+                qwen_context_position_ids,
+                total_seq_len=x_action.shape[1],
+            )
             rotary_info = self._build_action_rotary_batch_info(
                 x_action=x_action,
                 action_valid_mask=action_valid_mask,
@@ -1919,6 +2064,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 janus_images_emb_mask=janus_images_emb_mask,
                 janus_image_grid_thw=janus_image_grid_thw,
                 video_grid_thw=cached_video_grid_thw,
+                qwen_position_ids=qwen_position_ids,
             )
             rotary_payload = self._build_bridge_rotary_payload(
                 rotary_info,
@@ -1944,15 +2090,66 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             token_ids = logits.argmax(dim=-1)
             spatial_parts.append(self._embed_special_token_ids(token_ids.unsqueeze(1)).to(self.dtype))
             last_anchor_hidden = anchor_hidden
-            last_token_ids = token_ids
+            generated_token_ids.append(token_ids)
 
         spatial_embeds = torch.cat(spatial_parts, dim=1)
         if return_spatial_debug:
             return spatial_embeds, {
                 "spatial_anchor_hidden": last_anchor_hidden.detach(),
-                "spatial_token_ids": last_token_ids.detach(),
+                "spatial_token_ids": torch.stack(generated_token_ids, dim=1).detach(),
             }
         return spatial_embeds
+
+    def _run_prefix_right_layers(
+        self,
+        context_embeds: torch.Tensor,
+        spatial_token_embeds: Optional[torch.Tensor],
+        janus_left_pad_lens: Optional[torch.Tensor],
+        janus_attention_mask: Optional[torch.Tensor],
+        janus_images_seq_mask: Optional[torch.Tensor],
+        janus_images_emb_mask: Optional[torch.Tensor],
+        janus_image_grid_thw: Optional[torch.Tensor],
+        qwen_context_position_ids: Optional[torch.Tensor] = None,
+    ):
+        x_prefix, prefix_valid_mask = self._build_action_sequence(
+            context_embeds=context_embeds,
+            spatial_token_embeds=spatial_token_embeds,
+            janus_left_pad_lens=janus_left_pad_lens,
+            janus_attention_mask=janus_attention_mask,
+        )
+        video_grid_thw = None
+        if is_multimodal_bridge_pos_scheme(self.bridge_pos_scheme):
+            video_grid_thw = self._get_cached_bridge_video_grid_thw(x_prefix.shape[0], x_prefix.device)
+        rotary_payload = self._build_rotary_payload_for_action(
+            x_prefix,
+            prefix_valid_mask,
+            janus_left_pad_lens,
+            janus_images_seq_mask,
+            janus_images_emb_mask,
+            janus_image_grid_thw,
+            video_grid_thw,
+            qwen_context_position_ids=qwen_context_position_ids,
+        )
+        hidden = x_prefix
+        for right_idx in range(self.prefix_layer_count):
+            spec = self.right_layer_specs[right_idx]
+            layer = self.right_layers[right_idx]
+            if spec["kind"] == "standalone":
+                hidden = self._run_standalone_right_layer(
+                    layer,
+                    hidden,
+                    prefix_valid_mask,
+                    rotary_payload,
+                    action_tail_token_count=0,
+                )
+            else:
+                hidden = layer.forward_action_only(
+                    hidden,
+                    action_valid_mask=prefix_valid_mask,
+                    rotary_payload=rotary_payload,
+                    action_tail_token_count=0,
+                )
+        return hidden, prefix_valid_mask
 
     @torch.no_grad()
     def generate_spatial_tokens_cached(
@@ -1964,10 +2161,10 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         janus_images_seq_mask: Optional[torch.Tensor] = None,
         janus_images_emb_mask: Optional[torch.Tensor] = None,
         janus_image_grid_thw: Optional[torch.Tensor] = None,
+        qwen_context_position_ids: Optional[torch.Tensor] = None,
         return_spatial_debug: bool = False,
     ):
         num_spatial_tokens = self._resolve_spatial_token_count(num_spatial_tokens)
-        self._clear_cached_action_prefix_kv()
         context_embeds = context_embeds.to(self.dtype)
         B = context_embeds.shape[0]
         device = context_embeds.device
@@ -1976,88 +2173,54 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         if janus_attention_mask is not None:
             janus_attention_mask = janus_attention_mask.to(device=device, dtype=torch.bool)
 
-        x_context, context_valid_mask = self._build_action_sequence(
-            context_embeds=context_embeds,
-            janus_left_pad_lens=janus_left_pad_lens,
-            janus_attention_mask=janus_attention_mask,
-        )
-        context_rotary_payload = self._build_action_rotary_payload_for_length(
-            batch_size=B,
-            total_action_len=x_context.shape[1],
-            action_valid_mask=context_valid_mask,
-            device=device,
-            dtype=x_context.dtype,
-            janus_left_pad_lens=janus_left_pad_lens,
-            janus_images_seq_mask=janus_images_seq_mask,
-            janus_images_emb_mask=janus_images_emb_mask,
-            janus_image_grid_thw=janus_image_grid_thw,
-        )
-        hidden = x_context
-        for wrapper in self.mot_attention_wrappers:
-            hidden = wrapper.forward_action_prefix_and_cache(
-                hidden,
-                action_valid_mask=context_valid_mask,
-                rotary_payload=context_rotary_payload,
-                action_tail_token_count=0,
-                append_to_cache=True,
-            )
-        hidden_norm = self._action_final_norm()(hidden)
-        anchor_idx = self._last_valid_context_indices(context_valid_mask, context_embeds.shape[1])
-        last_anchor_hidden = hidden_norm[torch.arange(B, device=device), anchor_idx]
-
         spatial_parts = []
-        last_prediction_anchor_hidden = last_anchor_hidden
-        last_token_ids = None
+        last_prediction_anchor_hidden = None
+        generated_token_ids = []
         for _ in range(num_spatial_tokens):
-            last_prediction_anchor_hidden = last_anchor_hidden
-            logits = self._special_token_logits(last_anchor_hidden)
-            token_ids = logits.argmax(dim=-1)
-            token_embeds = self._embed_special_token_ids(token_ids.unsqueeze(1)).to(self.dtype)
-            spatial_parts.append(token_embeds)
-            last_token_ids = token_ids
-
-            prefix_len = self._get_cached_action_prefix_len()
-            token_valid_mask = torch.ones((B, 1), device=device, dtype=torch.bool)
-            full_valid_mask = torch.cat(
-                [
-                    self._get_cached_action_prefix_valid_mask().to(device=device, dtype=torch.bool),
-                    token_valid_mask,
-                ],
-                dim=1,
-            )
-            full_rotary_payload = self._build_action_rotary_payload_for_length(
-                batch_size=B,
-                total_action_len=prefix_len + 1,
-                action_valid_mask=full_valid_mask,
-                device=device,
-                dtype=token_embeds.dtype,
+            prev = torch.cat(spatial_parts, dim=1) if spatial_parts else None
+            hidden, valid_mask = self._run_prefix_right_layers(
+                context_embeds=context_embeds,
+                spatial_token_embeds=prev,
                 janus_left_pad_lens=janus_left_pad_lens,
+                janus_attention_mask=janus_attention_mask,
                 janus_images_seq_mask=janus_images_seq_mask,
                 janus_images_emb_mask=janus_images_emb_mask,
                 janus_image_grid_thw=janus_image_grid_thw,
+                qwen_context_position_ids=qwen_context_position_ids,
             )
-            token_rotary_payload = self._slice_bridge_rotary_payload(
-                full_rotary_payload,
-                prefix_len,
-                prefix_len + 1,
-            )
-            token_hidden = token_embeds
-            for wrapper in self.mot_attention_wrappers:
-                token_hidden = wrapper.forward_action_prefix_and_cache(
-                    token_hidden,
-                    action_valid_mask=token_valid_mask,
-                    rotary_payload=token_rotary_payload,
-                    action_tail_token_count=0,
-                    append_to_cache=True,
-                )
-            token_hidden_norm = self._action_final_norm()(token_hidden)
-            last_anchor_hidden = token_hidden_norm[:, -1, :]
+            hidden_norm = self._action_final_norm()(hidden)
+            if prev is None:
+                anchor_idx = self._last_valid_context_indices(valid_mask, context_embeds.shape[1])
+            else:
+                anchor_idx = torch.full((B,), context_embeds.shape[1] + prev.shape[1] - 1, device=device, dtype=torch.long)
+            anchor_hidden = hidden_norm[torch.arange(B, device=device), anchor_idx]
+            logits = self._special_token_logits(anchor_hidden)
+            token_ids = logits.argmax(dim=-1)
+            token_embeds = self._embed_special_token_ids(token_ids.unsqueeze(1)).to(self.dtype)
+            spatial_parts.append(token_embeds)
+            last_prediction_anchor_hidden = anchor_hidden
+            generated_token_ids.append(token_ids)
 
         spatial_embeds = torch.cat(spatial_parts, dim=1)
+        final_hidden, final_valid_mask = self._run_prefix_right_layers(
+            context_embeds=context_embeds,
+            spatial_token_embeds=spatial_embeds,
+            janus_left_pad_lens=janus_left_pad_lens,
+            janus_attention_mask=janus_attention_mask,
+            janus_images_seq_mask=janus_images_seq_mask,
+            janus_images_emb_mask=janus_images_emb_mask,
+            janus_image_grid_thw=janus_image_grid_thw,
+            qwen_context_position_ids=qwen_context_position_ids,
+        )
+        self._cached_prefix_hidden = final_hidden.detach()
+        self._cached_action_prefix_valid_mask = final_valid_mask.detach().clone()
+        self._cached_qwen_context_position_ids = (
+            None if qwen_context_position_ids is None else qwen_context_position_ids.detach().clone()
+        )
         if return_spatial_debug:
             return spatial_embeds, {
                 "spatial_anchor_hidden": last_prediction_anchor_hidden.detach(),
-                "spatial_token_ids": last_token_ids.detach(),
+                "spatial_token_ids": torch.stack(generated_token_ids, dim=1).detach(),
             }
         return spatial_embeds
 
@@ -2073,6 +2236,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         janus_images_seq_mask: Optional[torch.Tensor] = None,
         janus_images_emb_mask: Optional[torch.Tensor] = None,
         janus_image_grid_thw: Optional[torch.Tensor] = None,
+        qwen_context_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         action_latent = action_latent.to(self.dtype)
         spatial_token_embeds = spatial_token_embeds.to(self.dtype)
@@ -2095,6 +2259,10 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         cached_video_grid_thw = None
         if is_multimodal_bridge_pos_scheme(self.bridge_pos_scheme):
             cached_video_grid_thw = self._get_cached_bridge_video_grid_thw(B, device)
+        qwen_position_ids = self._extend_qwen_position_ids(
+            qwen_context_position_ids,
+            total_seq_len=x_action.shape[1],
+        )
         rotary_info = self._build_action_rotary_batch_info(
             x_action=x_action,
             action_valid_mask=action_valid_mask,
@@ -2103,6 +2271,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             janus_images_emb_mask=janus_images_emb_mask,
             janus_image_grid_thw=janus_image_grid_thw,
             video_grid_thw=cached_video_grid_thw,
+            qwen_position_ids=qwen_position_ids,
         )
         rotary_payload = self._build_bridge_rotary_payload(
             rotary_info,
@@ -2164,21 +2333,27 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             janus_images_seq_mask=janus_images_seq_mask,
             janus_images_emb_mask=janus_images_emb_mask,
             janus_image_grid_thw=janus_image_grid_thw,
+            qwen_context_position_ids=getattr(self, "_cached_qwen_context_position_ids", None),
         )
-        suffix_rotary_payload = self._slice_bridge_rotary_payload(
-            full_rotary_payload,
-            prefix_len,
-            total_len,
-        )
-        hidden = suffix
-        insert_layer = int(self.action_insert_layer)
-        for wrapper in self.mot_attention_wrappers[insert_layer:]:
-            hidden = wrapper.forward_action_suffix_only(
-                hidden,
-                suffix_valid_mask=suffix_valid_mask,
-                rotary_payload=suffix_rotary_payload,
-                action_tail_token_count=action_latent.shape[1],
-            )
+        hidden = torch.cat([self._cached_prefix_hidden, suffix], dim=1)
+        for right_idx in range(self.prefix_layer_count, self.right_layer_count):
+            spec = self.right_layer_specs[right_idx]
+            layer = self.right_layers[right_idx]
+            if spec["kind"] == "standalone":
+                hidden = self._run_standalone_right_layer(
+                    layer,
+                    hidden,
+                    full_valid_mask,
+                    full_rotary_payload,
+                    action_tail_token_count=action_latent.shape[1],
+                )
+            else:
+                hidden = layer.forward_action_only(
+                    hidden,
+                    action_valid_mask=full_valid_mask,
+                    rotary_payload=full_rotary_payload,
+                    action_tail_token_count=action_latent.shape[1],
+                )
         hidden_norm = self._action_final_norm()(hidden)
         action_out = hidden_norm[:, -action_latent.shape[1]:, :]
         return self.janus.final_layer(action_out)
@@ -2346,6 +2521,11 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             janus_images_emb_mask=janus_images_emb_mask,
             janus_image_grid_thw=janus_image_grid_thw,
         ).to(self.dtype)
+        qwen_context_position_ids = self._build_qwen_context_position_ids(
+            janus_input_ids=janus_input_ids,
+            janus_image_grid_thw=janus_image_grid_thw,
+            janus_attention_mask=janus_attention_mask,
+        )
         cosmos_context_embeds = None
         if cosmos_text_embeddings is None and cosmos_janus_input_ids is not None:
             if cosmos_janus_images_seq_mask is None or cosmos_janus_images_emb_mask is None:
@@ -2398,6 +2578,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 janus_image_grid_thw=janus_image_grid_thw,
                 cosmos_text_embeddings=cosmos_text_embeddings,
                 cosmos_context_embeds=cosmos_context_embeds,
+                qwen_context_position_ids=qwen_context_position_ids,
                 cache_video_kv=False,
             )
 
@@ -2533,8 +2714,11 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
         cosmos_janus_image_grid_thw: Optional[torch.Tensor] = None,
         return_spatial_debug: bool = False,
         return_latent_visual_debug: bool = False,
+        decode_video: bool = True,
         **unused_kwargs,
     ):
+        if action_denoise_steps <= 0:
+            raise ValueError("action_denoise_steps must be positive.")
         if cosmos_denoise_steps <= 0:
             raise ValueError("cosmos_denoise_steps must be positive.")
         if num_spatial_tokens is None:
@@ -2562,6 +2746,11 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
             janus_images_emb_mask=janus_images_emb_mask,
             janus_image_grid_thw=janus_image_grid_thw,
         ).to(self.dtype)
+        qwen_context_position_ids = self._build_qwen_context_position_ids(
+            janus_input_ids=janus_input_ids,
+            janus_image_grid_thw=janus_image_grid_thw,
+            janus_attention_mask=janus_attention_mask,
+        )
         cosmos_context_embeds = None
         if cosmos_text_embeddings is None and cosmos_janus_input_ids is not None:
             if cosmos_janus_images_seq_mask is None or cosmos_janus_images_emb_mask is None:
@@ -2651,6 +2840,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 janus_images_seq_mask=janus_images_seq_mask,
                 janus_images_emb_mask=janus_images_emb_mask,
                 janus_image_grid_thw=janus_image_grid_thw,
+                qwen_context_position_ids=qwen_context_position_ids,
                 return_spatial_debug=return_spatial_debug or return_latent_visual_debug,
             )
             spatial_debug = None
@@ -2674,7 +2864,7 @@ class CosmosJanusActionSpatialMoT2Expert(nn.Module):
                 )
                 x_act = x_act - dt * pred_act_v
 
-            pred_video = self.cosmos_vae.decode(x_vid.to(self.dtype))
+            pred_video = self.cosmos_vae.decode(x_vid.to(self.dtype)) if decode_video else None
             outputs = [pred_video, x_act]
             if return_spatial_debug or return_latent_visual_debug:
                 outputs.append(spatial_debug)

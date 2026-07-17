@@ -46,7 +46,8 @@ SHELL_LOG="${LOG_DIR}/test_rlbench_trainset_attn_vis_shell_${EVAL_ARTIFACT_NAME}
 BASH_HPARAMS_FILE="${ATTENTION_VISUALIZATION_DIR}/test_rlbench_trainset_attn_vis_hparams_${EVAL_ARTIFACT_NAME}.env"
 
 DATA_JSON="${DATA_JSON:-/mnt/nas/zhangyiming/database/rlbench/train/json/train_action_chunk1_sumpos_lastrot.json}"
-JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
+QWEN3VL2B_MODEL_PATH="${QWEN3VL2B_MODEL_PATH:-/mnt/amlfs-07/shared/physicalword/ckpt/pretraine/Qwen3-VL-2B-Instruct}"
+JANUS_MODEL_PATH="${JANUS_MODEL_PATH:-${QWEN3VL2B_MODEL_PATH}}"
 ACTION_MODEL_PATH="${ACTION_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/T-Rex_pretrain_mecka22k_epoch1}"
 COSMOS_MODEL_PATH="${COSMOS_MODEL_PATH:-/mnt/nas/zhangyiming/database/ckpt/pretrained/Cosmos-Predict2.5-2B/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt}"
 COSMOS_EXPERIMENT_NAME="${COSMOS_EXPERIMENT_NAME:-Stage-c_pt_4-reason_embeddings-v1p1-Index-26-Size-2B-Res-720-Fps-16-Note-T2V_high_sigma_loss_reweighted_1_1_rectified_flow_only}"
@@ -71,6 +72,7 @@ STATE_ENCODING_MODE="${STATE_ENCODING_MODE:-mlp}"
 BRIDGE_POS_SCHEME="${BRIDGE_POS_SCHEME:-mrope}"
 ACTION_SELF_CAUSAL_IN_BRIDGE="${ACTION_SELF_CAUSAL_IN_BRIDGE:-true}"
 ACTION_USE_LATENT_PREFIX="${ACTION_USE_LATENT_PREFIX:-true}"
+RIGHT_SINGLE_ATTN_POSITION="${RIGHT_SINGLE_ATTN_POSITION:-last4}"
 COSMOS_SELF_ONLY_BRIDGE="${COSMOS_SELF_ONLY_BRIDGE:-false}"
 DECOSMOS="${DECOSMOS:-false}"
 FPS="${FPS:-10}"
@@ -98,10 +100,15 @@ case "${SPATIAL_TOKEN_MODE}" in
     ;;
 esac
 
-DEFAULT_EXTRA_SPECIAL_TOKENS="</PAD>,</MOVE>,</PICK>,</PLACE>,</ROTATE>,</PUSH>,</NONE>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
-EXTRA_SPECIAL_TOKENS="${EXTRA_SPECIAL_TOKENS:-${DEFAULT_EXTRA_SPECIAL_TOKENS}}"
+DEFAULT_SPECIAL_TOKEN_VOCAB="</PAD>,</MOVE>,</PICK>,</PLACE>,</ROTATE>,</PULL>,</PUSH>,</NONE>,</box>,</broom>,</charger>,</frame>,</fridge>,</lamp>,</laptop>,</phone>,</toilet>,</umbrella>,</watering_can>,</wine>"
+SPECIAL_TOKEN_VOCAB="${SPECIAL_TOKEN_VOCAB:-${DEFAULT_SPECIAL_TOKEN_VOCAB}}"
 USE_SPATIAL_HIDDEN_SIM_LOSS="${USE_SPATIAL_HIDDEN_SIM_LOSS:-1}"
 SPATIAL_HIDDEN_SIM_LOSS_MODE="${SPATIAL_HIDDEN_SIM_LOSS_MODE:-siglip}"
+
+if [[ -z "$QWEN3VL2B_MODEL_PATH" ]]; then
+  echo "[ERROR] QWEN3VL2B_MODEL_PATH must be set for the 32-layer right-branch architecture."
+  exit 1
+fi
 
 DEFAULT_TASK_NAMES="close_box,close_laptop_lid,sweep_to_dustpan,phone_on_base,toilet_seat_down,close_fridge,place_wine_at_rack_location,water_plants,take_umbrella_out_of_umbrella_stand,take_frame_off_hanger"
 TASK_IDS="${TASK_IDS:-}"
@@ -156,12 +163,12 @@ write_hparam() {
     SCRIPT_DIR LAST05_ROOT COSMOS_ROOT EXPERIMENTS_ROOT OUTPUT_ROOT_DIR RUN_NAME RUN_DIR CHECKPOINT_NAME PRETRAINED_CHECKPOINT \
     EVAL_TIMESTAMP EVAL_ARTIFACT_NAME ATTENTION_VISUALIZATION_DIR LOG_DIR SHELL_LOG BASH_HPARAMS_FILE \
     OMP_NUM_THREADS HF_HUB_OFFLINE \
-    DATA_JSON JANUS_MODEL_PATH ACTION_MODEL_PATH COSMOS_MODEL_PATH COSMOS_EXPERIMENT_NAME COSMOS_TEXT_CACHE_PATH \
+    DATA_JSON JANUS_MODEL_PATH ACTION_MODEL_PATH QWEN3VL2B_MODEL_PATH COSMOS_MODEL_PATH COSMOS_EXPERIMENT_NAME COSMOS_TEXT_CACHE_PATH \
     ACTION_DIM ACTION_CHUNK VIDEO_H VIDEO_W VIDEO_FRAMES NUM_COND_INPUT_FRAMES IMG_LATENTS_PER_FUTURE STATE_LATENTS_PER_FUTURE NUM_FUTURE_FRAMES FUTURE_FRAME_STRIDE \
     ROBOT_STATE STATE_PLACEHOLDER_TOKENS STATE_DIM STATE_ENCODING_MODE \
-    BRIDGE_POS_SCHEME ACTION_SELF_CAUSAL_IN_BRIDGE ACTION_USE_LATENT_PREFIX COSMOS_SELF_ONLY_BRIDGE DECOSMOS \
+    BRIDGE_POS_SCHEME ACTION_SELF_CAUSAL_IN_BRIDGE ACTION_USE_LATENT_PREFIX RIGHT_SINGLE_ATTN_POSITION COSMOS_SELF_ONLY_BRIDGE DECOSMOS \
     FPS ACTION_DENOISE_STEPS COSMOS_DENOISE_STEPS \
-    SPATIAL_TOKEN_MODE_RAW SPATIAL_TOKEN_MODE TOTAL_SPATIAL_TOKEN_COUNT EXTRA_SPECIAL_TOKENS USE_SPATIAL_HIDDEN_SIM_LOSS SPATIAL_HIDDEN_SIM_LOSS_MODE \
+    SPATIAL_TOKEN_MODE_RAW SPATIAL_TOKEN_MODE TOTAL_SPATIAL_TOKEN_COUNT SPECIAL_TOKEN_VOCAB USE_SPATIAL_HIDDEN_SIM_LOSS SPATIAL_HIDDEN_SIM_LOSS_MODE \
     DEFAULT_TASK_NAMES TASK_IDS TASK_NAMES NUM_TRAJECTORIES_PER_TASK MAX_RECORDS_PER_EPISODE MAX_TOTAL_RECORDS \
     ATTN_VIS_TILE_SIZE ATTN_VIS_ALPHA ATTN_VIS_CAPTURE_MODE ATTN_VIS_TOP_RATIO ATTN_VIS_TOP_SOFTNESS CUDA_DEVICE SEED EMPTY_CACHE_EVERY \
     PYREP_PYTHON_PATH LIFT3D_ROOT RLBENCH_ROOT
@@ -198,6 +205,7 @@ python -u "${SCRIPT_DIR}/run_rlbench_trainset_attn_vis_mot2_trex.py" \
   --pretrained_checkpoint "$PRETRAINED_CHECKPOINT" \
   --model_path "$JANUS_MODEL_PATH" \
   --action_model_path "$ACTION_MODEL_PATH" \
+  --qwen3vl2b_model_path "$QWEN3VL2B_MODEL_PATH" \
   --cosmos_model_path "$COSMOS_MODEL_PATH" \
   --cosmos_experiment_name "$COSMOS_EXPERIMENT_NAME" \
   --cosmos_text_cache_path "$COSMOS_TEXT_CACHE_PATH" \
@@ -228,7 +236,7 @@ python -u "${SCRIPT_DIR}/run_rlbench_trainset_attn_vis_mot2_trex.py" \
   --state_encoding_mode "$STATE_ENCODING_MODE" \
   --total_latent_tokens "$TOTAL_SPATIAL_TOKEN_COUNT" \
   --latent_token_mode "$SPATIAL_TOKEN_MODE" \
-  --extra_special_tokens "$EXTRA_SPECIAL_TOKENS" \
+  --special_token_vocab "$SPECIAL_TOKEN_VOCAB" \
   --img_latents_per_future "$IMG_LATENTS_PER_FUTURE" \
   --state_latents_per_future "$STATE_LATENTS_PER_FUTURE" \
   --num_future_frames "$NUM_FUTURE_FRAMES" \
@@ -240,6 +248,7 @@ python -u "${SCRIPT_DIR}/run_rlbench_trainset_attn_vis_mot2_trex.py" \
   --bridge_pos_scheme "$BRIDGE_POS_SCHEME" \
   --action_use_latent_prefix "$ACTION_USE_LATENT_PREFIX" \
   --action_self_causal_in_bridge "$ACTION_SELF_CAUSAL_IN_BRIDGE" \
+  --right_single_attn_position "$RIGHT_SINGLE_ATTN_POSITION" \
   --action_denoise_steps "$ACTION_DENOISE_STEPS" \
   --cosmos_denoise_steps "$COSMOS_DENOISE_STEPS" \
   --fps "$FPS" \

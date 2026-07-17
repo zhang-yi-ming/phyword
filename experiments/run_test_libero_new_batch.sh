@@ -261,9 +261,9 @@ validate_run_config() {
 
   bridge_pos_scheme="$(array_value BRIDGE_POS_SCHEME_VALUES "$idx")"
   case "$bridge_pos_scheme" in
-    mrope|mrope_interleave|llama1d|local|last0) ;;
+    mrope|mrope_interleave|llama1d|qwen|local|last0) ;;
     *)
-      echo "[ERROR] BRIDGE_POS_SCHEME_VALUES[$idx] must be mrope, mrope_interleave, llama1d, local, or last0; got: ${bridge_pos_scheme}"
+      echo "[ERROR] BRIDGE_POS_SCHEME_VALUES[$idx] must be mrope, mrope_interleave, llama1d, qwen, local, or last0; got: ${bridge_pos_scheme}"
       exit 1
       ;;
   esac

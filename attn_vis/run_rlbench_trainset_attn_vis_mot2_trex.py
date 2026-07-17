@@ -164,7 +164,8 @@ class TrainsetAttnVisConfig:
     bridge_pos_scheme: str = "mrope"
     action_use_latent_prefix: bool = True
     action_self_causal_in_bridge: bool = True
-    action_insert_layer: int = 0
+    qwen3vl2b_model_path: str = "/mnt/amlfs-07/shared/physicalword/ckpt/pretraine/Qwen3-VL-2B-Instruct"
+    right_single_attn_position: str = "last4"
     action_denoise_steps: int = 10
     cosmos_denoise_steps: int = 2
     fps: float = 10.0
@@ -209,9 +210,9 @@ def parse_args() -> TrainsetAttnVisConfig:
             f"got {cfg.attention_visualization_top_softness}."
         )
     resolve_spatial_token_args(cfg)
-    cfg.action_insert_layer = int(getattr(cfg, "action_insert_layer", 0) or 0)
-    if cfg.action_insert_layer < 0 or cfg.action_insert_layer > 27:
-        raise ValueError("action_insert_layer must be in [0, 27].")
+    cfg.right_single_attn_position = str(getattr(cfg, "right_single_attn_position", "last4") or "last4").lower()
+    if cfg.right_single_attn_position not in ("first4", "last4"):
+        raise ValueError("right_single_attn_position must be 'first4' or 'last4'.")
     return cfg
 
 
@@ -393,15 +394,26 @@ def model_load(cfg: TrainsetAttnVisConfig, log_file=None):
     cfg.total_spatial_tokens = int(cfg.total_latent_tokens)
 
     ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
-    processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
+    processor = load_processor_for_checkpoint(cfg.qwen3vl2b_model_path or cfg.action_model_path or cfg.model_path, base_dir)
     tokenizer = processor.tokenizer
     cfg.janus_image_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
     cfg.janus_image_end_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
     cfg.latent_end_id = tokenizer.eos_token_id
     cfg.trex_image_token_id = int(tokenizer.convert_tokens_to_ids("<|image_pad|>"))
 
+    if not str(getattr(cfg, "qwen3vl2b_model_path", "") or "").strip():
+        raise ValueError("--qwen3vl2b_model_path is required for the 32-layer right-branch architecture.")
+    log_message(f"Loading Qwen3VL2B base from {cfg.qwen3vl2b_model_path}", log_file)
+    janus_model, _ = TrexActionModel.from_qwen3vl_checkpoint(
+        cfg.qwen3vl2b_model_path,
+        action_dim=cfg.action_dim,
+        action_chunk=cfg.action_chunk,
+        torch_dtype=torch.bfloat16,
+        use_robot_state=bool(cfg.robot_state),
+        verbose=True,
+    )
     log_message(f"Loading T-Rex action backend from {cfg.action_model_path}", log_file)
-    janus_model, _ = TrexActionModel.from_checkpoint(
+    trex_action_model, _ = TrexActionModel.from_checkpoint(
         cfg.action_model_path,
         action_dim=cfg.action_dim,
         action_chunk=cfg.action_chunk,
@@ -409,6 +421,8 @@ def model_load(cfg: TrainsetAttnVisConfig, log_file=None):
         use_robot_state=bool(cfg.robot_state),
         verbose=True,
     )
+    janus_model.transplant_action_components_from(trex_action_model, fast_layer_count=4)
+    del trex_action_model
     cfg.trex_spatial_merge_size = int(getattr(janus_model.visual, "spatial_merge_size", 2) or 2)
 
     import cosmos_predict2._src.predict2.models.text2world_model_rectified_flow as t2w_module
@@ -571,10 +585,10 @@ class AttentionMapRecorder:
         if self.total_spatial_tokens not in (1, 2):
             raise ValueError(f"total_latent_tokens must be 1 or 2, got {self.total_spatial_tokens}.")
         self.num_layers = int(num_layers)
-        self.first_action_layer_idx = int(getattr(cfg, "action_insert_layer", 0) or 0)
+        self.first_action_layer_idx = 28
         if self.first_action_layer_idx < 0 or self.first_action_layer_idx >= self.num_layers:
             raise ValueError(
-                f"action_insert_layer must be in [0, {self.num_layers - 1}], got {self.first_action_layer_idx}."
+                f"first action layer must be in [0, {self.num_layers - 1}], got {self.first_action_layer_idx}."
             )
         self.alpha = float(getattr(cfg, "attention_visualization_alpha", 0.45) or 0.45)
         self.tile_size = max(16, int(getattr(cfg, "attention_visualization_tile_size", 256) or 256))

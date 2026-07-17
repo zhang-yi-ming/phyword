@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -184,6 +185,32 @@ class TrexActionModel(nn.Module):
                 print(f"  first skipped mismatch: {skipped[0]}")
         return wrapped, info
 
+    @classmethod
+    def from_qwen3vl_checkpoint(
+        cls,
+        checkpoint_path: str,
+        action_dim: int,
+        action_chunk: int,
+        torch_dtype=torch.bfloat16,
+        use_robot_state: bool = False,
+        verbose: bool = True,
+    ) -> Tuple["TrexActionModel", dict]:
+        """Build the compatibility wrapper from a plain Qwen3VL/VL checkpoint."""
+        path = os.path.abspath(os.path.expanduser(str(checkpoint_path)))
+        vla = Qwen3VLVLAModel.from_pretrained_qwen3vl(
+            path,
+            action_dim=int(action_dim),
+            action_chunk=int(action_chunk),
+            use_robot_state=bool(use_robot_state),
+            torch_dtype=torch_dtype,
+        )
+        vla.to(dtype=torch_dtype)
+        wrapped = cls(vla)
+        info = {"checkpoint_dir": path}
+        if verbose:
+            print(f"[TrexActionModel] initialized base Qwen3VL wrapper from {path}")
+        return wrapped, info
+
     def resize_token_embeddings(self, target_vocab_size: int):
         target_vocab_size = int(target_vocab_size)
         old_embed = self.vla.model.embed_tokens
@@ -211,6 +238,21 @@ class TrexActionModel(nn.Module):
         self._refresh_language_model_proxy()
         return new_embed
 
+    def transplant_action_components_from(self, action_model: "TrexActionModel", fast_layer_count: int = 4) -> None:
+        """Copy T-Rex flow/action modules and expose the last action layers."""
+        self.vla.t_embedder = copy.deepcopy(action_model.vla.t_embedder)
+        self.vla.x_embedder = copy.deepcopy(action_model.vla.x_embedder)
+        self.vla.final_layer = copy.deepcopy(action_model.vla.final_layer)
+        self.t_embedder = self.vla.t_embedder
+        self.x_embedder = self.vla.x_embedder
+        self.final_layer = self.vla.final_layer
+        layers = list(action_model.vla.model.layers)
+        fast_layer_count = int(fast_layer_count)
+        if fast_layer_count <= 0 or len(layers) < fast_layer_count:
+            raise ValueError(f"Cannot copy {fast_layer_count} T-Rex action layers from {len(layers)} layers.")
+        self.fast_action_layers = nn.ModuleList([copy.deepcopy(layer) for layer in layers[-fast_layer_count:]])
+        self._refresh_language_model_proxy()
+
     def prepare_inputs_embeds(
         self,
         input_ids: torch.LongTensor,
@@ -221,6 +263,25 @@ class TrexActionModel(nn.Module):
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+        )
+
+    def get_rope_index(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        return self.vla.get_rope_index(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+        )
+
+    def extend_position_ids(self, position_ids: torch.Tensor, extra_token_count: int) -> torch.Tensor:
+        return self.vla.model._extend_position_ids(
+            position_ids,
+            n_action=int(extra_token_count),
+            n_tactile=0,
         )
 
     def visual_mean_features(

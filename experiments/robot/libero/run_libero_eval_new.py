@@ -45,13 +45,13 @@ from models.trex_action_backend import TrexActionModel, resolve_trex_checkpoint_
 from cosmos_predict2._src.predict2.utils.model_loader import load_model_from_checkpoint
 from scripts.rewrite_input_prompts import PROMPT_REPLACEMENTS
 from utils.cosmos_text_cache import CosmosQwenTextEmbedder, CosmosTextEmbeddingCache
+from utils.model_config_manifest import load_model_manifest, validate_runtime_model_config
 from utils.trex_processor import load_trex_processor
 
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
-    get_libero_wrist_image,
     quat2axisangle,
     save_rollout_video,
 )
@@ -66,26 +66,12 @@ JANUS_ACTION_PROMPT_SUFFIX = (
     "and output the action to execute now."
 )
 DEFAULT_SPECIAL_TOKEN_VOCAB = [
-    "</PAD>",
     "</MOVE>",
+    "</BOWWL>",
     "</PICK>",
     "</PLACE>",
-    "</ROTATE>",
-    "</PULL>",
-    "</PUSH>",
-    "</NONE>",
-    "</box>",
-    "</broom>",
-    "</charger>",
-    "</frame>",
-    "</fridge>",
-    "</lamp>",
-    "</laptop>",
-    "</phone>",
-    "</toilet>",
-    "</umbrella>",
-    "</watering_can>",
-    "</wine>",
+    "</APPROACH>",
+    "</bowl>",
 ]
 SPECIAL_TOKEN_VOCAB_FILENAME = "special_token_vocab.json"
 
@@ -189,18 +175,20 @@ class GenerateConfig:
     # Model Architecture Overrides (Matching Training)
     video_h: int = 256
     video_w: int = 256
-    video_frames: int = 1
-    num_cond_input_frames: int = 1
+    video_frames: int = 17
+    num_cond_input_frames: int = 5
     action_dim: int = 7
     action_chunk: int = 16
     robot_state: int = 0
-    state_placeholder_tokens: int = 8
+    state_placeholder_tokens: int = 1
     state_dim: int = 8
     state_encoding_mode: str = "mlp"
     action_intermediate_size: int = 0                # If 0, infer slim MLP size from checkpoint; if >0, require an exact match
     model_variant: str = "mot2_action_spatial"      # This eval script builds the 2-MoT Cosmos + action-spatial model.
     total_latent_tokens: int = 1                     # Number of latent token CE tokens to generate at eval time
+    latent_token_mode: str = "v"                    # v, n, or vn; retained for checkpoint provenance
     special_token_vocab: str = ",".join(DEFAULT_SPECIAL_TOKEN_VOCAB)  # Fallback independent spatial-token vocab
+    special_token_weight_tied: bool = True           # Small-vocab input/output weights are shared
     img_latents_per_future: int = 0
     state_latents_per_future: int = 0
     num_future_frames: int = 0
@@ -212,10 +200,11 @@ class GenerateConfig:
     use_action_value_prediction: bool = False        # Fixed 2-MoT behavior: no action value token
     value_token_mask_video_to_value: bool = False     # If true, video tokens cannot attend to value tokens
     value_token_mask_nonvalue_to_value: bool = False  # If true, all non-value tokens cannot attend to value tokens
-    bridge_pos_scheme: str = "mrope"                 # Accepts mrope/mrope_interleave/llama1d plus legacy aliases local/last0
+    bridge_pos_scheme: str = "mrope"                 # Accepts mrope/mrope_interleave/llama1d/qwen plus legacy aliases local/last0
     action_use_latent_prefix: bool = True            # Match training option that prepends wrist image + current state to the action branch
     action_use_image_prefix: bool = False            # Legacy alias for action_use_latent_prefix
-    action_insert_layer: int = 0                     # 0 keeps legacy behavior; >0 inserts t/action after this many MoT layers
+    qwen3vl2b_model_path: str = "/mnt/amlfs-07/shared/physicalword/ckpt/pretraine/Qwen3-VL-2B-Instruct"  # Plain Qwen3VL2B checkpoint for the first 28 right-branch layers
+    right_single_attn_position: str = "first4"       # first4/last4 standalone right-layer placement
     use_history_trajectory_janus_image: bool = False  # If true, draw EE history on the Janus primary image at eval time
     history_trajectory_camera_config_path: str = DEFAULT_HISTORY_TRAJECTORY_CAMERA_CONFIG
 
@@ -333,13 +322,10 @@ def resolve_special_token_init_ids(tokenizer, special_token_vocab: list[str]) ->
 
 def validate_special_token_checkpoint_rows(state_dict: dict[str, Any], special_token_vocab: list[str]) -> None:
     expected = len(special_token_vocab)
-    row_keys = [
-        "special_token_embedding.weight",
-        "special_token_lm_head.weight",
-    ]
+    row_keys = ["special_token_embedding.weight"]
     missing = [key for key in row_keys if key not in state_dict]
     if missing:
-        raise ValueError(f"Checkpoint is missing independent special-token weights: {missing}")
+        raise ValueError(f"Checkpoint is missing tied special-token weights: {missing}")
     mismatches = []
     for key in row_keys:
         rows = int(state_dict[key].shape[0])
@@ -410,6 +396,7 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert cfg.pretrained_checkpoint is not None, "pretrained_checkpoint must not be None!"
     assert cfg.num_open_loop_steps > 0, "num_open_loop_steps must be positive!"
     assert cfg.action_repeat > 0, "action_repeat must be positive!"
+    assert cfg.action_denoise_steps > 0, "action_denoise_steps must be positive!"
     assert cfg.cosmos_denoise_steps > 0, "cosmos_denoise_steps must be positive!"
     cfg.cosmos_text_cache_path = str(getattr(cfg, "cosmos_text_cache_path", "") or "").strip()
     cfg.predicted_video_save_dir = str(getattr(cfg, "predicted_video_save_dir", "") or "").strip()
@@ -447,9 +434,9 @@ def validate_config(cfg: GenerateConfig) -> None:
     cfg.value_token_mask_nonvalue_to_value = False
     cfg.value_token_mask_video_to_value = False
     cfg.action_self_causal_in_bridge = True
-    cfg.action_insert_layer = int(getattr(cfg, "action_insert_layer", 0) or 0)
-    if cfg.action_insert_layer < 0 or cfg.action_insert_layer > 27:
-        raise ValueError("action_insert_layer must be in [0, 27].")
+    cfg.right_single_attn_position = str(getattr(cfg, "right_single_attn_position", "first4") or "first4").lower()
+    if cfg.right_single_attn_position not in ("first4", "last4"):
+        raise ValueError("right_single_attn_position must be 'first4' or 'last4'.")
     if int(getattr(cfg, "future_frame_stride", 0) or 0) <= 0:
         cfg.future_frame_stride = cfg.action_chunk
     cfg.bridge_pos_scheme = normalize_bridge_pos_scheme(cfg.bridge_pos_scheme)
@@ -466,6 +453,21 @@ def validate_config(cfg: GenerateConfig) -> None:
         raise ValueError(
             f"Token latent CE inference requires total_latent_tokens=1 or 2, got {cfg.total_latent_tokens}."
         )
+    cfg.latent_token_mode = str(getattr(cfg, "latent_token_mode", "v") or "v").lower()
+    cfg.latent_token_mode = {"1": "v", "2": "vn"}.get(
+        cfg.latent_token_mode,
+        cfg.latent_token_mode,
+    )
+    expected_spatial_tokens = {"v": 1, "n": 1, "vn": 2}
+    if cfg.latent_token_mode not in expected_spatial_tokens:
+        raise ValueError("latent_token_mode must be one of v, n, vn, 1, or 2.")
+    if int(cfg.total_latent_tokens) != expected_spatial_tokens[cfg.latent_token_mode]:
+        raise ValueError(
+            "total_latent_tokens does not match latent_token_mode: "
+            f"mode={cfg.latent_token_mode!r}, count={cfg.total_latent_tokens}."
+        )
+    if not coerce_bool(getattr(cfg, "special_token_weight_tied", True)):
+        raise ValueError("This model version requires special_token_weight_tied=true.")
 
     if "image_aug" in str(cfg.pretrained_checkpoint):
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
@@ -675,13 +677,15 @@ def log_resolved_inference_config(cfg: Any) -> None:
     print(f"  bridge_pos_scheme={getattr(cfg, 'bridge_pos_scheme', '')}")
     print(f"  action_use_latent_prefix={int(bool(getattr(cfg, 'action_use_latent_prefix', False)))}")
     print(f"  action_use_image_prefix_alias={int(bool(getattr(cfg, 'action_use_image_prefix', False)))}")
-    print(f"  action_insert_layer={int(getattr(cfg, 'action_insert_layer', 0) or 0)}")
+    print(f"  right_single_attn_position={getattr(cfg, 'right_single_attn_position', 'first4')}")
     print(f"  use_history_trajectory_janus_image={int(bool(getattr(cfg, 'use_history_trajectory_janus_image', False)))}")
     print(f"  history_trajectory_camera_config_path={getattr(cfg, 'history_trajectory_camera_config_path', '')}")
     print(f"  robot_state={int(getattr(cfg, 'robot_state', 0) or 0)}")
     print(f"  state_placeholder_tokens={int(getattr(cfg, 'state_placeholder_tokens', 0) or 0)}")
     print(f"  state_encoding_mode={getattr(cfg, 'state_encoding_mode', 'token')}")
     print(f"  total_latent_tokens={int(getattr(cfg, 'total_latent_tokens', 0) or 0)}")
+    print(f"  latent_token_mode={getattr(cfg, 'latent_token_mode', '')}")
+    print(f"  special_token_weight_tied={int(bool(getattr(cfg, 'special_token_weight_tied', True)))}")
     print(f"  img_latents_per_future={int(getattr(cfg, 'img_latents_per_future', 0) or 0)}")
     print(f"  state_latents_per_future={int(getattr(cfg, 'state_latents_per_future', 0) or 0)}")
     print(f"  num_future_frames={int(getattr(cfg, 'num_future_frames', 0) or 0)}")
@@ -720,8 +724,9 @@ def model_load(cfg: Any):
     cfg.total_spatial_tokens = int(getattr(cfg, "total_latent_tokens", 1) or 1)
     ckpt_path, base_dir = resolve_checkpoint_paths(cfg.pretrained_checkpoint)
 
-    print(f"Loading Processor from checkpoint/base: {base_dir} / {cfg.action_model_path or cfg.model_path}...")
-    processor = load_processor_for_checkpoint(cfg.action_model_path or cfg.model_path, base_dir)
+    processor_fallback_path = cfg.qwen3vl2b_model_path or cfg.action_model_path or cfg.model_path
+    print(f"Loading Processor from checkpoint/base: {base_dir} / {processor_fallback_path}...")
+    processor = load_processor_for_checkpoint(processor_fallback_path, base_dir)
     tokenizer = processor.tokenizer
     action_tokenizer = None
     cfg.janus_image_start_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -729,8 +734,19 @@ def model_load(cfg: Any):
     cfg.latent_end_id = tokenizer.eos_token_id
     cfg.trex_image_token_id = int(tokenizer.convert_tokens_to_ids("<|image_pad|>"))
 
+    if not str(getattr(cfg, "qwen3vl2b_model_path", "") or "").strip():
+        raise ValueError("--qwen3vl2b_model_path is required for the 32-layer right-branch architecture.")
+    print(f"Loading Qwen3VL2B Base from {cfg.qwen3vl2b_model_path}...")
+    janus_model, _ = TrexActionModel.from_qwen3vl_checkpoint(
+        cfg.qwen3vl2b_model_path,
+        action_dim=cfg.action_dim,
+        action_chunk=cfg.action_chunk,
+        torch_dtype=torch.bfloat16,
+        use_robot_state=bool(cfg.robot_state),
+        verbose=True,
+    )
     print(f"Loading T-Rex Action Base from {cfg.action_model_path}...")
-    janus_model, trex_loading_info = TrexActionModel.from_checkpoint(
+    trex_action_model, trex_loading_info = TrexActionModel.from_checkpoint(
         cfg.action_model_path,
         action_dim=cfg.action_dim,
         action_chunk=cfg.action_chunk,
@@ -738,13 +754,19 @@ def model_load(cfg: Any):
         use_robot_state=bool(cfg.robot_state),
         verbose=True,
     )
+    janus_model.transplant_action_components_from(trex_action_model, fast_layer_count=4)
+    del trex_action_model
     print(f"T-Rex skipped mismatched tensors={len(trex_loading_info['skipped_mismatch'])}")
     
     # =================================================================
     # 3. 加载 Cosmos 骨架 (配合猴子补丁屏蔽 T5 文本编码器)
     # =================================================================
     print("Loading Cosmos Video Base...")
-    experiment_opts = ["data_train=mock", "data_val=mock"]
+    experiment_opts = [
+        "data_train=mock",
+        "data_val=mock",
+        "model.config.net.sac_config.mode=none",
+    ]
 
     import cosmos_predict2._src.predict2.models.text2world_model_rectified_flow as t2w_module
     import torch.nn as nn
@@ -761,7 +783,8 @@ def model_load(cfg: Any):
         config_file="cosmos_predict2/_src/predict2/configs/video2world/config.py",
         load_ema_to_reg=True,
         to_device="cpu",
-        experiment_opts=experiment_opts
+        experiment_opts=experiment_opts,
+        seed=cfg.seed,
     )
     resolve_video_condition_config(cfg, cosmos_wrapper.tokenizer)
     
@@ -777,6 +800,14 @@ def model_load(cfg: Any):
     cfg.special_token_vocab = load_special_token_vocab(base_dir, getattr(cfg, "special_token_vocab", ""))
     cfg.special_token_init_ids = resolve_special_token_init_ids(tokenizer, cfg.special_token_vocab)
     validate_special_token_checkpoint_rows(state_dict, cfg.special_token_vocab)
+    model_manifest = load_model_manifest(base_dir)
+    if model_manifest is None:
+        print(
+            "Warning: checkpoint has no model_config.json; "
+            "model topology is being reconstructed from runtime arguments."
+        )
+    else:
+        validate_runtime_model_config(cfg, model_manifest)
     checkpoint_vocab_size = infer_checkpoint_vocab_size(state_dict)
     ensure_janus_tokenizer_alignment(janus_model, tokenizer, target_vocab_size=checkpoint_vocab_size)
     cfg.valid_token_vocab_size = int(len(tokenizer))
@@ -789,9 +820,11 @@ def model_load(cfg: Any):
     attach_cosmos_inference_runtime(model, cosmos_wrapper)
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    
-    if len(missing_keys) > 0:
-        print(f"Warning: Missing keys in state_dict (usually OK if they are caches): {missing_keys[:5]}...")
+
+    if missing_keys:
+        print(f"Warning: Missing checkpoint keys ({len(missing_keys)}): {missing_keys[:20]}")
+    if unexpected_keys:
+        print(f"Warning: Unexpected checkpoint keys ({len(unexpected_keys)}): {unexpected_keys[:20]}")
 
     # 推到 GPU 并设置为推理模式
     device = torch.device(f"cuda:{cfg.cuda}" if torch.cuda.is_available() else "cuda")
@@ -1152,14 +1185,10 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
 
 def prepare_observation(obs):
     """Prepare observation for policy input."""
-    # Get preprocessed images
     img = get_libero_image(obs)
-    wrist_img = get_libero_wrist_image(obs)
 
-    # Prepare observations dict
     observation = {
         "full_image": img,
-        "wrist_image": wrist_img,
         "state": np.concatenate(
             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
         ),
@@ -1333,7 +1362,6 @@ def run_episode(
 
         current_state = observation['state'].copy()
         primary_image = Image.fromarray(observation['full_image'])
-        wrist_image = Image.fromarray(observation['wrist_image'])
         primary_frame_np = np.array(primary_image)
         primary_frame_tensor = torch.from_numpy(primary_frame_np).permute(2, 0, 1).float() / 255.0
         primary_frame_tensor = video_transform(primary_frame_tensor)
@@ -1387,16 +1415,19 @@ def run_episode(
                 return_tensors="pt",
                 padding=False,
             )
-            cosmos_user_content = f"{eval_prompt}"
-            if state_tokens_str:
-                cosmos_user_content += "\n" + state_tokens_str
-            cosmos_prompt_text = build_qwen_chat_prompt(processor, cosmos_user_content)
-            cosmos_janus_inputs = processor(
-                text=cosmos_prompt_text,
-                images=[janus_primary_image],
-                return_tensors="pt",
-                padding=False,
-            )
+            if cfg.cosmos_text_cache_path:
+                cosmos_janus_inputs = janus_inputs
+            else:
+                cosmos_user_content = f"{eval_prompt}"
+                if state_tokens_str:
+                    cosmos_user_content += "\n" + state_tokens_str
+                cosmos_prompt_text = build_qwen_chat_prompt(processor, cosmos_user_content)
+                cosmos_janus_inputs = processor(
+                    text=cosmos_prompt_text,
+                    images=[janus_primary_image],
+                    return_tensors="pt",
+                    padding=False,
+                )
 
             janus_input_ids = janus_inputs.input_ids.to(device)
             janus_pixel_values = janus_inputs.pixel_values.to(device).to(dtype)
@@ -1491,6 +1522,7 @@ def run_episode(
                     cosmos_janus_images_seq_mask=cosmos_janus_images_seq_mask,
                     cosmos_janus_state_seq_mask=cosmos_janus_state_seq_mask,
                     cosmos_janus_images_emb_mask=cosmos_janus_images_seq_mask,
+                    decode_video=bool(cfg.predicted_video_save_dir),
                 )
 
                 inference_outputs = model.forward_flow_joint_inference(**inference_kwargs)
@@ -1568,8 +1600,9 @@ def run_episode(
             for action in action_pred[:cfg.num_open_loop_steps]:
                 action_queue.extend([action] * cfg.action_repeat)
 
-        replay_images.append(img)
-        if cfg.use_value_prediction or cfg.use_action_value_prediction:
+        if cfg.rollout_video_save_dir:
+            replay_images.append(img)
+        if cfg.rollout_video_save_dir and (cfg.use_value_prediction or cfg.use_action_value_prediction):
             replay_value_scores.append(None if active_value_scores is None else dict(active_value_scores))
 
         # 执行动作
@@ -1671,17 +1704,17 @@ def run_task(
             task_successes += 1
             total_successes += 1
 
-        # Save replay video
-        save_rollout_video(
-            replay_images,
-            total_episodes,
-            success=success,
-            task_description=task_description,
-            log_file=log_file,
-            cosmos_denoise_steps=cfg.cosmos_denoise_steps,
-            rollout_dir=cfg.rollout_video_save_dir,
-            value_scores=replay_value_scores if (cfg.use_value_prediction or cfg.use_action_value_prediction) else None,
-        )
+        if cfg.rollout_video_save_dir:
+            save_rollout_video(
+                replay_images,
+                total_episodes,
+                success=success,
+                task_description=task_description,
+                log_file=log_file,
+                cosmos_denoise_steps=cfg.cosmos_denoise_steps,
+                rollout_dir=cfg.rollout_video_save_dir,
+                value_scores=replay_value_scores if (cfg.use_value_prediction or cfg.use_action_value_prediction) else None,
+            )
 
         # Log results
         log_message(f"Success: {success}", log_file)
